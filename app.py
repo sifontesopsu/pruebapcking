@@ -25,14 +25,15 @@ from contextlib import contextmanager
 # =========================
 # CONFIG
 # =========================
-DB_NAME = "aurora_ml.db"
+DB_NAME = "aurora_ml_PRUEBAS_SIN_SHEETS.db"  # Aislada de la base operativa
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
 
-# Respaldo persistente PICKING. Se usa el mismo webhook operativo del WMS FULL,
-# pero puede reemplazarse mediante Streamlit Secrets o variable de entorno
-# PICKING_SHEETS_WEBHOOK_URL sin modificar el código.
-DEFAULT_PICKING_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
+# MODO PRUEBAS: Sheets completamente desconectado.
+# Bandera fija: no se puede reactivar mediante variables de entorno ni st.secrets.
+# Esta copia guarda los datos en SQLite local, sin crear cola de eventos remotos.
+PICKING_SHEETS_BACKUP_ENABLED = False
+DEFAULT_PICKING_SHEETS_WEBHOOK_URL = ""  # Se omite el endpoint de producción
 PICKING_BACKUP_MAX_ATTEMPTS = 8
 PICKING_BACKUP_WORKER_LIMIT = 120
 PICKING_SNAPSHOT_MAX_JSON_BYTES = 30000
@@ -502,7 +503,9 @@ def _picking_clean(value) -> str:
 
 
 def get_picking_backup_webhook_url() -> str:
-    """Webhook de respaldo. Secret/env puede reemplazar la URL por defecto."""
+    """Retorna URL sólo si Sheets está habilitado. En esta versión siempre es vacía."""
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return ""
     env_url = _picking_clean(os.getenv("PICKING_SHEETS_WEBHOOK_URL", ""))
     if env_url:
         return env_url
@@ -554,7 +557,9 @@ def enqueue_picking_backup_event(event_type: str, payload: dict) -> int | None:
 
 
 def enqueue_picking_backup_events_batch(events: list[tuple[str, dict]]) -> list[int]:
-    """Encola eventos localmente; nunca espera a Google Sheets en la operación del PDA."""
+    """Modo pruebas: no se crea cola ni se envía información a Sheets."""
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return []
     if not events:
         return []
     created_at = now_iso()
@@ -592,6 +597,8 @@ def _is_picking_backup_transient(message: str) -> bool:
 
 
 def _send_picking_webhook_event(url: str, event: dict, timeout: int = 25) -> tuple[bool, str]:
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return False, "Respaldo Google Sheets deshabilitado en la versión de pruebas."
     try:
         resp = requests.post(url, json=event, timeout=(5, int(timeout)), allow_redirects=True)
     except Exception as exc:
@@ -674,7 +681,9 @@ def _release_picking_backup_lease(owner: str):
 
 
 def flush_picking_backup_queue(limit: int = 40, include_failed: bool = False) -> int:
-    """Drena la cola en orden, con un solo escritor efectivo hacia Apps Script."""
+    """Drena la cola sólo con sincronización habilitada."""
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return 0
     url = get_picking_backup_webhook_url()
     if not url:
         return 0
@@ -761,8 +770,10 @@ def _picking_backup_worker(limit: int):
 
 
 def trigger_picking_backup_sync_async(limit: int = 40) -> bool:
-    """Best-effort en segundo plano: el PDA nunca espera a Sheets."""
+    """Modo pruebas: no inicia hilos de sincronización."""
     global _PICKING_BACKUP_THREAD_RUNNING
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return False
     if not get_picking_backup_webhook_url():
         return False
     with _PICKING_BACKUP_THREAD_LOCK:
@@ -1123,6 +1134,8 @@ def queue_picking_batch_closed_if_complete(batch_key: str):
 
 
 def _read_picking_sheets_json(params: dict, timeout: int = 40, attempts: int = 3) -> tuple[bool, dict, str]:
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return False, {}, "Respaldo Google Sheets deshabilitado en esta versión de pruebas."
     url = get_picking_backup_webhook_url()
     if not url:
         return False, {}, "No hay webhook de respaldo configurado."
@@ -1298,6 +1311,8 @@ def _delete_local_picking_batch(conn, batch_key: str):
 
 
 def restore_picking_batch_from_sheets(batch_key: str, replace_existing: bool = True) -> tuple[bool, str]:
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return False, "Rescate desde Sheets deshabilitado en la versión de pruebas."
     ok, raw_events, msg = get_picking_backup_events_from_sheets(batch_key)
     if not ok:
         return False, msg
@@ -1532,7 +1547,9 @@ def _picking_recovery_is_active() -> bool:
 
 
 def auto_restore_picking_if_database_was_lost() -> tuple[bool, str]:
-    """Auto-rescate sólo para DB vacío no marcado como reinicio intencional."""
+    """En esta edición, nunca intenta recuperar datos de Sheets."""
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return False, "rescate_sheets_deshabilitado"
     if not _picking_local_is_empty():
         return False, "local_not_empty"
     if _picking_meta_get("intentional_reset"):
@@ -1564,6 +1581,8 @@ def auto_restore_picking_if_database_was_lost() -> tuple[bool, str]:
 
 
 def render_picking_backup_sidebar():
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return
     status = get_picking_backup_status()
     pending = int(status.get("pending") or 0)
     failed = int(status.get("failed") or 0)
@@ -1582,6 +1601,8 @@ def render_picking_backup_sidebar():
 
 
 def render_picking_recovery_admin_ui():
+    if not PICKING_SHEETS_BACKUP_ENABLED:
+        return
     with st.expander("☁️ Respaldo automático / Rescate desde Sheets", expanded=False):
         status = get_picking_backup_status()
         a, b, c = st.columns(3)
@@ -8146,6 +8167,7 @@ def main():
     _sfx_global_click_hook()
     sfx_render_pending()
     init_db()
+    st.sidebar.warning("MODO PRUEBAS · SIN GOOGLE SHEETS · BD LOCAL INDEPENDIENTE")
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, familia_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
@@ -8186,29 +8208,29 @@ def main():
     # MODO PICKING FLEX / COLECTA
     # ==========
     if mode == "FLEX_PICK":
-        # Mantener la cola drenando sin bloquear PDA. Si Streamlit recreó SQLite vacío,
-        # intentar recuperar automáticamente sólo los lotes Picking que sigan activos.
-        trigger_picking_backup_sync_async(limit=PICKING_BACKUP_WORKER_LIMIT)
-        render_picking_backup_sidebar()
-        if _picking_local_is_empty() and not st.session_state.get("_picking_auto_recovery_checked", False):
-            st.session_state["_picking_auto_recovery_checked"] = True
-            recovered, recovery_msg = auto_restore_picking_if_database_was_lost()
-            if recovered:
-                st.session_state["picking_recovery_flash"] = recovery_msg
-                st.session_state.pop("selected_picker", None)
+        # Los procesos de envío y rescate Sheets quedan completamente anulados en pruebas.
+        if PICKING_SHEETS_BACKUP_ENABLED:
+            trigger_picking_backup_sync_async(limit=PICKING_BACKUP_WORKER_LIMIT)
+            render_picking_backup_sidebar()
+            if _picking_local_is_empty() and not st.session_state.get("_picking_auto_recovery_checked", False):
+                st.session_state["_picking_auto_recovery_checked"] = True
+                recovered, recovery_msg = auto_restore_picking_if_database_was_lost()
+                if recovered:
+                    st.session_state["picking_recovery_flash"] = recovery_msg
+                    st.session_state.pop("selected_picker", None)
+                    st.rerun()
+                elif recovery_msg not in {"local_not_empty", "intentional_reset", "no_active_lotes", "recovery_in_progress"}:
+                    st.sidebar.warning(f"Rescate Sheets: {recovery_msg}")
+
+            if _picking_recovery_is_active():
+                st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se actualizará automáticamente al terminar.")
+                st.caption("No necesitas presionar F5. Verificando nuevamente en 2 segundos…")
+                time.sleep(2)
                 st.rerun()
-            elif recovery_msg not in {"local_not_empty", "intentional_reset", "no_active_lotes", "recovery_in_progress"}:
-                st.sidebar.warning(f"Rescate Sheets: {recovery_msg}")
 
-        if _picking_recovery_is_active():
-            st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se actualizará automáticamente al terminar.")
-            st.caption("No necesitas presionar F5. Verificando nuevamente en 2 segundos…")
-            time.sleep(2)
-            st.rerun()
-
-        recovery_flash = st.session_state.pop("picking_recovery_flash", None)
-        if recovery_flash:
-            st.success(f"☁️ {recovery_flash}")
+            recovery_flash = st.session_state.pop("picking_recovery_flash", None)
+            if recovery_flash:
+                st.success(f"☁️ {recovery_flash}")
 
         pages = [
             "1) Picking",
