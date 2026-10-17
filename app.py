@@ -53,12 +53,12 @@ PICKING_TABLES = [
     "picking_incidences",
     "cortes_tasks",
     "ot_orders",
+    # Documentos históricos locales: incluirlos en el respaldo manual.
+    "despacho_tandas",
+    "despacho_ventas",
+    "despacho_etiquetas",
+    "despacho_etiquetas_pdf",
 ]
-SORTING_TABLES = [
-    # Sorting v2 (único)
-    "s2_manifests","s2_files","s2_sales","s2_items","s2_page_assign","s2_labels","s2_pack_ship",
-]
-
 
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
@@ -1715,6 +1715,9 @@ def _restore_tables_from_db_bytes(db_bytes: bytes, tables: list[str]) -> tuple[b
     cdst = conn_dst.cursor()
 
     try:
+        # La restauración puede reemplazar tablas padre e hijas dentro del mismo lote.
+        # FK se reactivan al finalizar y se verifica que no haya enlaces huérfanos.
+        conn_dst.execute("PRAGMA foreign_keys=OFF;")
         # Validación mínima: que exista al menos 1 de las tablas esperadas
         any_ok = False
         for tname in tables:
@@ -1747,6 +1750,9 @@ def _restore_tables_from_db_bytes(db_bytes: bytes, tables: list[str]) -> tuple[b
                 ph = ",".join(["?"] * ncols)
                 cdst.executemany(f"INSERT INTO {tname} VALUES ({ph});", rows)
 
+        violations = conn_dst.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise ValueError(f"Respaldo con referencias incompletas: {violations[:3]}")
         conn_dst.commit()
         return True, None
     except Exception as e:
@@ -1761,6 +1767,7 @@ def _restore_tables_from_db_bytes(db_bytes: bytes, tables: list[str]) -> tuple[b
         except Exception:
             pass
         try:
+            conn_dst.execute("PRAGMA foreign_keys=ON;")
             conn_dst.close()
         except Exception:
             pass
@@ -2049,7 +2056,7 @@ def init_db():
     );
     """)
 
-    # Módulos activos: Picking y Sorting.
+    # Único flujo operativo: Picking; documentos se gestionan por tanda.
 
     # --- MIGRACIONES SUAVES (para BD antiguas) ---
     def _cols(table: str) -> set:
@@ -2116,6 +2123,8 @@ def init_db():
         pass
 
     conn.commit()
+    from manifiestos_etiquetas import create_schema
+    create_schema(conn)
     conn.close()
 
 # =========================
@@ -2669,7 +2678,7 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
         return line.strip()
 
     with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages, start=1):
             text = (page.extract_text() or "").replace("\r", "\n")
             lines = [ln.strip() for ln in text.splitlines() if ln and str(ln).strip()]
 
@@ -2737,12 +2746,13 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                                     "sku_ml": str(sku_current).strip(),
                                     "title_ml": "",
                                     "qty": qty,
+                                    "pagina_ml": page_idx,
                                 }
                             )
                             # Importante: NO limpiamos sku_current aquí, porque puede venir otra Cantidad asociada
                             # al mismo SKU en el mismo bloque (raro, pero seguro).
 
-    return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
+    return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty", "pagina_ml"])
 
 
 
@@ -3512,6 +3522,7 @@ def save_orders_and_build_ots(
     model: str = "VENTAS",
     familia_map_sku: dict | None = None,
     source_label: str | None = None,
+    dispatch_payload: dict | None = None,
 ):
     """
     Genera la tanda de picking.
@@ -3632,6 +3643,8 @@ def save_orders_and_build_ots(
                     VALUES (?,?,?,?,?,?,?,?,?,?)
                     """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None, None))
 
+        from manifiestos_etiquetas import save_with_picking
+        save_with_picking(conn, batch_key, batch_label, dispatch_payload)
         conn.commit()
         conn.close()
         _picking_meta_set("intentional_reset", "")
@@ -3684,6 +3697,8 @@ def save_orders_and_build_ots(
                     VALUES (?,?,?,?,?,?,?,?,?,?)
                 """, (ot_id, sku, title_eff, title_tec, total, 0, "PENDING", None, None, fam))
 
+    from manifiestos_etiquetas import save_with_picking
+    save_with_picking(conn, batch_key, batch_label, dispatch_payload)
     conn.commit()
     conn.close()
     _picking_meta_set("intentional_reset", "")
@@ -3698,6 +3713,7 @@ def append_orders_and_build_ots(
     model: str = "VENTAS",
     familia_map_sku: dict | None = None,
     source_label: str | None = None,
+    dispatch_payload: dict | None = None,
 ):
     """Agrega una nueva carga de picking sin borrar la tanda actual."""
     model = (model or "VENTAS").upper().strip()
@@ -3822,6 +3838,8 @@ def append_orders_and_build_ots(
                     VALUES (?,?,?,?,?,?,?,?,?,?)
                     """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None, None))
 
+        from manifiestos_etiquetas import save_with_picking
+        save_with_picking(conn, batch_key, batch_label, dispatch_payload)
         conn.commit()
         conn.close()
         _picking_meta_set("intentional_reset", "")
@@ -3869,6 +3887,8 @@ def append_orders_and_build_ots(
                     VALUES (?,?,?,?,?,?,?,?,?,?)
                 """, (ot_id, sku, title_eff, title_tec, total, 0, "PENDING", None, None, fam))
 
+    from manifiestos_etiquetas import save_with_picking
+    save_with_picking(conn, batch_key, batch_label, dispatch_payload)
     conn.commit()
     conn.close()
     _picking_meta_set("intentional_reset", "")
@@ -3878,177 +3898,121 @@ def append_orders_and_build_ots(
 
 
 # =========================
-# UI: LOBBY APP (MODO)
+# UI: IMPORTAR TANDA + ETIQUETAS
 # =========================
-def page_app_lobby():
-    st.markdown("## Ferretería Aurora – WMS")
-    st.caption("Selecciona el flujo de trabajo")
-
-    st.markdown(
-        """
-        <style>
-        .lobbybtn button {
-            width: 100% !important;
-            padding: 22px 14px !important;
-            font-size: 22px !important;
-            font-weight: 900 !important;
-            border-radius: 18px !important;
-        }
-        .lobbywrap { max-width: 900px; margin: 0 auto; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown('<div class="lobbywrap">', unsafe_allow_html=True)
-    colA, colB = st.columns(2)
-
-    with colA:
-        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-        if st.button("📦 Picking pedidos Flex y Colecta", key="mode_flex_pick"):
-            st.session_state.app_mode = "FLEX_PICK"
-            st.session_state.pop("selected_picker", None)
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.caption("Picking por OT, incidencias, admin, cortes, etc.")
-
-    with colB:
-        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-        if st.button("🧾 Sorting pedidos Flex y Colecta", key="mode_sorting"):
-            st.session_state.app_mode = "SORTING"
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.caption("Camarero por mesa/página (1 página = 1 mesa).")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
 def page_import(inv_map_sku: dict, familia_map_sku: dict):
-    st.header("Importar ventas")
+    """Carga simultánea de ventas + etiquetas en una sola tanda de picking."""
+    from manifiestos_etiquetas import prepare_upload
 
-    flash = st.session_state.get("picking_import_flash")
+    st.header("2) Importar ventas y etiquetas")
+    flash = st.session_state.pop("picking_import_flash", None)
     if flash:
-        if isinstance(flash, dict):
-            level = str(flash.get("level") or "success").lower().strip()
-            msg = str(flash.get("message") or "").strip()
-        else:
-            level = "success"
-            msg = str(flash).strip()
-        if msg:
-            if level == "warning":
-                st.warning(msg)
-            elif level == "error":
-                st.error(msg)
-            else:
-                st.success(msg)
-        st.session_state.pop("picking_import_flash", None)
+        st.success(flash) if isinstance(flash, str) else st.info(str(flash))
 
     batches = _get_picking_batches_summary()
     if batches:
-        st.subheader("Tandas de picking activas")
-        cols = st.columns(min(3, len(batches)))
-        for i, batch in enumerate(batches):
-            with cols[i % len(cols)]:
-                with st.container(border=True):
-                    st.markdown(f"**{batch['batch_label']}**")
-                    st.caption(f"Creada: {to_chile_display(batch['created_at'])}")
-                    total = int(batch.get('total_tasks', 0) or 0)
-                    done = int(batch.get('done_tasks', 0) or 0)
-                    pct = float(batch.get('progress_pct', 0.0) or 0.0)
-                    st.progress(min(max(pct / 100.0, 0.0), 1.0))
-                    st.caption(f"{done}/{total} tareas resueltas · {pct:.1f}%")
-                    st.write(f"**Pickeadores:** {batch.get('pickers') or '-'}")
-                    a, b = st.columns(2)
-                    a.metric("Ventas", int(batch.get('orders_count', 0) or 0))
-                    b.metric("OTs abiertas", int(batch.get('open_ots', 0) or 0))
-        st.divider()
+        st.subheader("Tandas operativas de picking")
+        table = [{"Tanda": b["batch_label"], "Ventas": b["orders_count"],
+                  "Pickeadores": b["pickers"], "Avance": f"{b['progress_pct']:.1f}%"}
+                 for b in batches]
+        st.dataframe(table, hide_index=True, use_container_width=True)
 
-    origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
-    num_pickers = st.number_input("Cantidad de pickeadores nuevos para esta carga", min_value=1, max_value=20, value=3 if batches else 5, step=1)
-    model_pick = st.radio("Elegir modelo", ["Por ventas", "Por sku"], horizontal=True)
-
+    origen = st.radio("Origen de ventas", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
+    num_pickers = st.number_input("Cantidad de pickeadores para esta tanda", min_value=1, max_value=20,
+                                  value=3 if batches else 5, step=1)
+    model_pick = st.radio("Modelo de distribución", ["Por ventas", "Por sku"], horizontal=True)
+    canal = st.radio("Tipo de despacho de esta tanda", ["Flex", "Colecta"], horizontal=True)
     next_names = [f"P{n}" for n in _next_picker_numbers(_get_current_picker_names(), int(num_pickers))]
-    st.info(f"Esta carga creará: **{', '.join(next_names)}**")
+    st.info(f"Se crearán: **{', '.join(next_names)}**")
 
-    source_label = ""
     if origen == "Excel Mercado Libre":
-        file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
-        if not file:
-            st.info("Sube el Excel de ventas.")
-            return
-        source_label = getattr(file, "name", "Excel ML")
-        sales_df = import_sales_excel(file)
+        sales_file = st.file_uploader("Archivo de ventas ML (XLSX)", type=["xlsx"], key="ml_excel")
     else:
-        pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
-        if not pdf_file:
-            st.info("Sube el PDF.")
+        sales_file = st.file_uploader("Manifiesto de Mercado Libre (PDF)", type=["pdf"], key="ml_pdf")
+
+    # Los documentos se exigen aquí, ANTES de guardar las OTs.
+    label_files = st.file_uploader(
+        "Etiquetas de envío de ESTA misma tanda (TXT/ZPL o PDF)",
+        type=["txt", "zpl", "pdf"], accept_multiple_files=True,
+        key="picking_etiquetas_tanda",
+        help="Puedes seleccionar varios archivos del mismo formato. No mezcles PDF y ZPL/TXT.",
+    )
+    if not sales_file:
+        st.info("Primero carga las ventas y las etiquetas que corresponden exactamente a esa tanda.")
+        return
+    try:
+        sales_df = (import_sales_excel(sales_file) if origen.startswith("Excel")
+                    else parse_manifest_pdf(sales_file))
+    except Exception as exc:
+        st.error(f"No fue posible leer el archivo de ventas: {exc}")
+        return
+    if sales_df is None or sales_df.empty:
+        st.error("No se encontraron ventas con SKU y cantidad. Revisa el archivo antes de continuar.")
+        return
+    st.subheader("Vista previa de ventas")
+    st.dataframe(sales_df.head(30), use_container_width=True)
+    if not label_files:
+        st.warning("Debes cargar las etiquetas correspondientes a estas ventas para crear la tanda.")
+        return
+
+    # No permitir cargas parciales inadvertidas: importar duplicados de OT haría que
+    # el archivo de etiquetas ya no correspondiera a las ventas realmente agregadas.
+    if batches:
+        filtered = _filter_sales_not_loaded_for_preview(sales_df)
+        if len(filtered["ml_order_id"].unique()) != len(sales_df["ml_order_id"].unique()):
+            st.error("Hay ventas ya asignadas a una tanda operativa. Quita esas ventas y sus etiquetas del archivo "
+                     "antes de agregar una tanda nueva; así evitamos imprimir despachos duplicados.")
             return
-        source_label = getattr(pdf_file, "name", "Manifiesto PDF")
-        sales_df = parse_manifest_pdf(pdf_file)
 
-    st.subheader("Vista previa")
-    st.dataframe(sales_df.head(30))
+    try:
+        uploaded = [(f.name, f.getvalue()) for f in label_files]
+        payload = prepare_upload(sales_df, inv_map_sku, uploaded, sales_file.name,
+                                 "EXCEL" if origen.startswith("Excel") else "PDF", canal.upper())
+    except Exception as exc:
+        st.error(f"Las etiquetas no coinciden con la carga: {exc}")
+        return
 
-    # Vista previa operativa sólo para el modelo Por SKU. Usa exactamente el mismo
-    # planificador que luego escribe las tareas, por lo que el reparto mostrado es el real.
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Ventas", len(payload["sales"]))
+    c2.metric("Etiquetas", payload["label_count"])
+    c3.metric("Tipo", f"{canal} · {payload['label_type']}")
+    if payload["pairing"] == "VENTA_ZPL":
+        st.success("Cada etiqueta ZPL quedó vinculada con una venta del manifiesto.")
+    for warning in payload["warnings"]:
+        st.warning(warning)
+
     if model_pick.startswith("Por sku"):
-        preview_sales_df = _filter_sales_not_loaded_for_preview(sales_df) if batches else sales_df.copy()
-        if preview_sales_df.empty:
-            st.warning("No hay ventas nuevas para repartir en esta carga.")
-        else:
-            preview_plan = _plan_sku_family_distribution(
-                preview_sales_df,
-                int(num_pickers),
-                familia_map_sku=familia_map_sku,
-                cortes_set=load_cortes_set(),
-                picker_names=next_names,
-            )
-            _render_sku_distribution_preview(preview_plan)
+        plan = _plan_sku_family_distribution(
+            sales_df, int(num_pickers), familia_map_sku=familia_map_sku,
+            cortes_set=load_cortes_set(), picker_names=next_names,
+        )
+        _render_sku_distribution_preview(plan)
 
-    action_label = "Agregar carga y generar nuevas OTs" if batches else "Cargar y generar OTs"
-    if st.button(action_label):
+    if st.button("Crear tanda de picking y guardar sus documentos", type="primary"):
         model = "VENTAS" if model_pick.startswith("Por ventas") else "SKU"
-        if batches:
-            result = append_orders_and_build_ots(
-                sales_df,
-                inv_map_sku,
-                int(num_pickers),
-                model=model,
-                familia_map_sku=familia_map_sku,
-                source_label=source_label,
-            )
-            if not result.get("created"):
-                if result.get("reason") == "duplicate":
-                    st.session_state["picking_import_flash"] = {
-                        "level": "warning",
-                        "message": "No se agregó una nueva tanda porque todas las ventas de este archivo ya estaban cargadas en la corrida actual.",
-                    }
-                    st.rerun()
-                else:
-                    st.session_state["picking_import_flash"] = {
-                        "level": "warning",
-                        "message": "No se pudo crear una nueva tanda con este archivo.",
-                    }
-                    st.rerun()
+        try:
+            if batches:
+                result = append_orders_and_build_ots(
+                    sales_df, inv_map_sku, int(num_pickers), model=model,
+                    familia_map_sku=familia_map_sku, source_label=sales_file.name,
+                    dispatch_payload=payload,
+                )
             else:
-                picker_names = [str(x).strip() for x in (result.get('picker_names') or []) if str(x).strip()]
-                ots_created = int(result.get('ots_created') or len(picker_names) or 0)
-                pickers_txt = ", ".join(picker_names) if picker_names else f"{ots_created} OT{'s' if ots_created != 1 else ''}"
-                st.session_state["picking_import_flash"] = {
-                    "level": "success",
-                    "message": f"Nueva carga creada correctamente: {pickers_txt}. Ya puedes ir a Picking.",
-                }
-                st.rerun()
-        else:
-            save_orders_and_build_ots(
-                sales_df, inv_map_sku, int(num_pickers), model=model,
-                familia_map_sku=familia_map_sku, source_label=source_label
+                result = save_orders_and_build_ots(
+                    sales_df, inv_map_sku, int(num_pickers), model=model,
+                    familia_map_sku=familia_map_sku, source_label=sales_file.name,
+                    dispatch_payload=payload,
+                )
+            if not result.get("created"):
+                st.error("No se creó la tanda: " + str(result.get("reason", "desconocido")))
+                return
+            st.session_state["picking_import_flash"] = (
+                f"Tanda creada: {result['batch_label']}. Documentos guardados para descargar en "
+                "5) Manifiestos y etiquetas."
             )
-            st.session_state["picking_import_flash"] = {
-                "level": "success",
-                "message": "OTs creadas. Anda a Picking y selecciona P1, P2, ...",
-            }
             st.rerun()
+        except Exception as exc:
+            st.error(f"No se pudo guardar la tanda y sus documentos: {exc}")
 
 
 # =========================
@@ -4558,7 +4522,7 @@ def page_picking():
         colA, colB = st.columns(2)
 
         with colA:
-            # Incidencia con nota (igual que Sorting): pedir motivo antes de guardar
+            # Incidencia con nota (igual que una incidencia documentada): pedir motivo antes de guardar
             if "pick_inc_pending" not in st.session_state:
                 st.session_state["pick_inc_pending"] = None
 
@@ -5006,12 +4970,13 @@ def page_admin():
         st.session_state.confirm_reset = False
 
     if not st.session_state.confirm_reset:
-        if st.button("Reiniciar corrida (BORRA TODO)"):
+        if st.button("Reiniciar corrida de Picking"):
             st.session_state.confirm_reset = True
-            st.warning("⚠️ Esto borrará TODA la información (OTs, tareas, incidencias y ventas). Confirma abajo.")
+            st.warning("Se borrarán OTs, tareas, incidencias y ventas operativas. "
+                       "Los manifiestos y etiquetas ya archivados seguirán disponibles en el módulo 5.")
             st.rerun()
     else:
-        st.error("CONFIRMACIÓN: se borrarán TODOS los datos del sistema.")
+        st.error("CONFIRMACIÓN: se reiniciará Picking, pero se conservarán los documentos históricos.")
         colA, colB = st.columns(2)
         with colA:
             if st.button("✅ Sí, borrar todo y reiniciar"):
@@ -5054,3221 +5019,173 @@ def page_admin():
 
     conn.close()
 
-def _s2_now_iso():
-    # Timestamp en hora Chile con offset
-    if CL_TZ is not None:
-        return datetime.now(CL_TZ).isoformat(timespec="seconds")
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def _s2_ensure_items_schema_runtime():
-    """Normaliza s2_items en tiempo de ejecución.
-
-    Esto evita errores en Streamlit Cloud cuando queda una base antigua con columnas
-    distintas a las que usa el Camarero. La función es idempotente y segura:
-    crea una tabla nueva con el esquema correcto, copia lo recuperable y reemplaza.
-    """
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
-            manifest_id INTEGER NOT NULL,
-            sale_id TEXT NOT NULL,
-            sku TEXT NOT NULL,
-            description TEXT,
-            qty INTEGER NOT NULL DEFAULT 0,
-            picked INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            confirm_mode TEXT,
-            updated_at TEXT,
-            PRIMARY KEY (manifest_id, sale_id, sku)
-        );""")
-        conn.commit()
-
-        cols = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
-        required = {"manifest_id", "sale_id", "sku", "description", "qty", "picked", "status"}
-        if required.issubset(set(cols)):
-            if "confirm_mode" not in cols:
-                c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
-            if "updated_at" not in cols:
-                c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
-            c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
-            c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
-            conn.commit()
-            return True
-
-        old_cols = list(cols)
-        c.execute("DROP TABLE IF EXISTS s2_items_runtime_new;")
-        c.execute("""CREATE TABLE s2_items_runtime_new (
-            manifest_id INTEGER NOT NULL,
-            sale_id TEXT NOT NULL,
-            sku TEXT NOT NULL,
-            description TEXT,
-            qty INTEGER NOT NULL DEFAULT 0,
-            picked INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            confirm_mode TEXT,
-            updated_at TEXT,
-            PRIMARY KEY (manifest_id, sale_id, sku)
-        );""")
-
-        def pick(*names, default="NULL"):
-            for name in names:
-                if name in old_cols:
-                    return name
-            return default
-
-        src_manifest = pick("manifest_id", "mid", default="0")
-        src_sale = pick("sale_id", "venta_id", "order_id", "ml_order_id", default="''")
-        src_sku = pick("sku", "sku_ml", "codigo_sku", default="''")
-        src_desc = pick("description", "descripcion", "title_ml", "title", "producto", default="''")
-        src_qty = pick("qty", "cantidad", "qty_total", "unidades", default="0")
-        src_picked = pick("picked", "qty_picked", "verificado", default="0")
-        src_status = pick("status", "estado", default="'PENDING'")
-        src_confirm = pick("confirm_mode", default="NULL")
-        src_updated = pick("updated_at", default="NULL")
-
-        c.execute(f"""
-            INSERT OR IGNORE INTO s2_items_runtime_new(manifest_id, sale_id, sku, description, qty, picked, status, confirm_mode, updated_at)
-            SELECT
-                COALESCE(CAST({src_manifest} AS INTEGER), 0),
-                COALESCE(CAST({src_sale} AS TEXT), ''),
-                COALESCE(CAST({src_sku} AS TEXT), ''),
-                COALESCE(CAST({src_desc} AS TEXT), ''),
-                COALESCE(CAST({src_qty} AS INTEGER), 0),
-                COALESCE(CAST({src_picked} AS INTEGER), 0),
-                COALESCE(CAST({src_status} AS TEXT), 'PENDING'),
-                {src_confirm},
-                {src_updated}
-            FROM s2_items
-            WHERE COALESCE(CAST({src_sku} AS TEXT), '') <> '';
-        """)
-        c.execute("DROP TABLE IF EXISTS s2_items_old_broken;")
-        c.execute("ALTER TABLE s2_items RENAME TO s2_items_old_broken;")
-        c.execute("ALTER TABLE s2_items_runtime_new RENAME TO s2_items;")
-        c.execute("DROP TABLE IF EXISTS s2_items_old_broken;")
-        c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
-        c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
-        conn.commit()
-        return True
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def _s2_create_tables():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_manifests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        status TEXT NOT NULL DEFAULT 'ACTIVE',
-        created_at TEXT NOT NULL
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_files (
-        manifest_id INTEGER PRIMARY KEY,
-        control_pdf BLOB,
-        labels_txt BLOB,
-        control_name TEXT,
-        labels_name TEXT,
-        updated_at TEXT NOT NULL
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_page_assign (
-        manifest_id INTEGER NOT NULL,
-        page_no INTEGER NOT NULL,
-        mesa INTEGER NOT NULL,
-        PRIMARY KEY (manifest_id, page_no)
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_mesa_status (
-        manifest_id INTEGER NOT NULL,
-        mesa INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'OPEN',
-        closed_at TEXT,
-        PRIMARY KEY (manifest_id, mesa)
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_sales (
-        manifest_id INTEGER NOT NULL,
-        sale_id TEXT NOT NULL,
-        shipment_id TEXT,
-        page_no INTEGER NOT NULL,
-        row_no INTEGER NOT NULL DEFAULT 0,
-        mesa INTEGER,
-        status TEXT NOT NULL DEFAULT 'NEW',
-        opened_at TEXT,
-        closed_at TEXT,
-        PRIMARY KEY (manifest_id, sale_id)
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
-        manifest_id INTEGER NOT NULL,
-        sale_id TEXT NOT NULL,
-        sku TEXT NOT NULL,
-        description TEXT,
-        qty INTEGER NOT NULL,
-        picked INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'PENDING',
-        PRIMARY KEY (manifest_id, sale_id, sku)
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_labels (
-        manifest_id INTEGER NOT NULL,
-        shipment_id TEXT NOT NULL,
-        raw TEXT,
-        PRIMARY KEY (manifest_id, shipment_id)
-    );""")
-
-    # --- Migraciones suaves (SQLite) ---
-    try:
-        cols = [r[1] for r in c.execute("PRAGMA table_info(s2_sales);").fetchall()]
-        if "row_no" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN row_no INTEGER NOT NULL DEFAULT 0;")
-        if "pack_id" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN pack_id TEXT;")
-        if "customer" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
-        if "destino" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN destino TEXT;")
-        if "comuna" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN comuna TEXT;")
-        if "ciudad_destino" not in cols:
-            c.execute("ALTER TABLE s2_sales ADD COLUMN ciudad_destino TEXT;")
-    except Exception:
-        pass
-
-    # s2_items: migración robusta para BD antiguas de Streamlit Cloud.
-    # Algunas corridas anteriores dejaron s2_items con columnas incompletas; si no normalizamos,
-    # Camarero falla al consultar sku/description/qty/picked/status.
-    try:
-        cols_i = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
-        sql_i_row = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='s2_items';").fetchone()
-        sql_i = (sql_i_row[0] if sql_i_row and sql_i_row[0] else "")
-        required_i = {"manifest_id", "sale_id", "sku", "description", "qty", "picked", "status"}
-        has_required = required_i.issubset(set(cols_i))
-        has_pk = "PRIMARY KEY (manifest_id, sale_id, sku)" in sql_i.replace("\n", " ")
-
-        if (not has_required) or (not has_pk):
-            old_cols_i = list(cols_i)
-            c.execute("ALTER TABLE s2_items RENAME TO s2_items_old_migration;")
-            c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
-                manifest_id INTEGER NOT NULL,
-                sale_id TEXT NOT NULL,
-                sku TEXT NOT NULL,
-                description TEXT,
-                qty INTEGER NOT NULL DEFAULT 0,
-                picked INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                confirm_mode TEXT,
-                updated_at TEXT,
-                PRIMARY KEY (manifest_id, sale_id, sku)
-            );""")
-
-            # Copiar lo recuperable desde nombres antiguos o alternativos.
-            src_manifest = "manifest_id" if "manifest_id" in old_cols_i else "NULL"
-            src_sale = "sale_id" if "sale_id" in old_cols_i else ("venta_id" if "venta_id" in old_cols_i else "''")
-            src_sku = "sku" if "sku" in old_cols_i else ("sku_ml" if "sku_ml" in old_cols_i else "''")
-            src_desc = "description" if "description" in old_cols_i else ("title_ml" if "title_ml" in old_cols_i else ("title_tec" if "title_tec" in old_cols_i else "''"))
-            src_qty = "qty" if "qty" in old_cols_i else ("qty_total" if "qty_total" in old_cols_i else "0")
-            src_picked = "picked" if "picked" in old_cols_i else ("qty_picked" if "qty_picked" in old_cols_i else "0")
-            src_status = "status" if "status" in old_cols_i else "'PENDING'"
-            src_confirm = "confirm_mode" if "confirm_mode" in old_cols_i else "NULL"
-            src_updated = "updated_at" if "updated_at" in old_cols_i else "NULL"
-
-            c.execute(f"""
-                INSERT OR IGNORE INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status, confirm_mode, updated_at)
-                SELECT
-                    COALESCE({src_manifest}, 0),
-                    COALESCE(CAST({src_sale} AS TEXT), ''),
-                    COALESCE(CAST({src_sku} AS TEXT), ''),
-                    CAST({src_desc} AS TEXT),
-                    COALESCE(CAST({src_qty} AS INTEGER), 0),
-                    COALESCE(CAST({src_picked} AS INTEGER), 0),
-                    COALESCE(CAST({src_status} AS TEXT), 'PENDING'),
-                    {src_confirm},
-                    {src_updated}
-                FROM s2_items_old_migration
-                WHERE COALESCE(CAST({src_sku} AS TEXT), '') <> '';
-            """)
-            c.execute("DROP TABLE IF EXISTS s2_items_old_migration;")
-        else:
-            if "confirm_mode" not in cols_i:
-                c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
-            if "updated_at" not in cols_i:
-                c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
-            if "picked" not in cols_i:
-                c.execute("ALTER TABLE s2_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0;")
-            if "status" not in cols_i:
-                c.execute("ALTER TABLE s2_items ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING';")
-        c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
-        c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
-    except Exception:
-        pass
-
-
-    # s2_mesa_status: compatibilidad / migración suave
-    try:
-        cols_ms = [r[1] for r in c.execute("PRAGMA table_info(s2_mesa_status);").fetchall()]
-        if "status" not in cols_ms:
-            c.execute("ALTER TABLE s2_mesa_status ADD COLUMN status TEXT NOT NULL DEFAULT 'OPEN';")
-        if "closed_at" not in cols_ms:
-            c.execute("ALTER TABLE s2_mesa_status ADD COLUMN closed_at TEXT;")
-    except Exception:
-        pass
-
-    # Mapa Pack ID -> Shipment ID (necesario para Colecta)
-    c.execute("""CREATE TABLE IF NOT EXISTS s2_pack_ship (
-        manifest_id INTEGER NOT NULL,
-        pack_id TEXT NOT NULL,
-        shipment_id TEXT NOT NULL,
-        PRIMARY KEY (manifest_id, pack_id)
-    );""")
-
-    conn.commit()
-    conn.close()
-
-def _s2_get_active_manifest_id():
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY id DESC LIMIT 1;")
-    row = c.fetchone()
-    if row:
-        mid = int(row[0])
-        conn.close()
-        return mid
-    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
-    mid = int(c.lastrowid)
-    conn.commit()
-    conn.close()
-    return mid
-
-
-def _s2_manifest_files_state(mid: int) -> dict:
-    """Return whether the active manifest already has Control and/or Labels loaded."""
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT (control_pdf IS NOT NULL AND length(control_pdf)>0) AS has_control, "
-        "       (labels_txt  IS NOT NULL AND length(labels_txt)>0)  AS has_labels "
-        "FROM s2_files WHERE manifest_id=?;",
-        (mid,),
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"has_control": False, "has_labels": False}
-    return {"has_control": bool(row[0]), "has_labels": bool(row[1])}
-
-def _s2_close_manifest(mid: int):
-    """Marks current manifest as DONE (archived)."""
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE s2_manifests SET status='DONE' WHERE id=?;", (int(mid),))
-    conn.commit()
-    conn.close()
-
-def _s2_create_new_manifest(status: str = 'ACTIVE') -> int:
-    """Crea un lote/manifiesto nuevo.
-    En la operación actual, confirmar carga = entrar directo a producción.
-    """
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES(?, ?);", (str(status or 'ACTIVE').upper(), _s2_now_iso()))
-    mid = int(c.lastrowid)
-    conn.commit()
-    conn.close()
-    return mid
-
-
-def _s2_manifest_has_content(mid: int) -> bool:
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    sales = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    items = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    labels = int(c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    pages = int(c.execute("SELECT COUNT(*) FROM s2_page_assign WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
-    conn.close()
-    has_files = bool(files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))
-    return any([sales, items, labels, pages, has_files])
-
-
-def _s2_list_work_manifests():
-    return _s2_list_open_manifests()
-
-
-def _s2_list_open_manifests():
-    _s2_migrate_staged_to_active()
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id, status, created_at FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;").fetchall()
-    out = []
-    for mid, status, created_at in rows:
-        mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
-        sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status!='DONE';", (int(mid),)).fetchone()[0] or 0)
-        items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (int(mid),)).fetchone()[0] or 0)
-        files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
-        out.append({
-            'id': int(mid),
-            'status': str(status),
-            'created_at': str(created_at or ''),
-            'mesas': mesas,
-            'mesas_text': _s2_mesas_text_from_list(mesas),
-            'lot_label': '',
-            'sales_total': sales_total,
-            'sales_pending': sales_pending,
-            'items_total': items_total,
-            'items_pending': items_pending,
-            'control_name': str(files[0] or '') if files else '',
-            'labels_name': str(files[1] or '') if files else '',
-            'has_content': bool(sales_total or items_total or mesas or (files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))),
-        })
-    conn.close()
-    for mf in out:
-        mf['lot_label'] = _s2_lot_label(int(mf['id']))
-    return out
-
-
-def _s2_get_locked_mesas(exclude_mid: int | None = None):
-    _s2_migrate_staged_to_active()
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    params = []
-    where_ex = ""
-    if exclude_mid is not None:
-        where_ex = " AND p.manifest_id<>?"
-        params.append(int(exclude_mid))
-    rows = c.execute(f"""SELECT DISTINCT p.mesa
-                        FROM s2_page_assign p
-                        JOIN s2_manifests m ON m.id = p.manifest_id
-                        LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
-                        WHERE m.status='ACTIVE'
-                          AND COALESCE(ms.status, 'OPEN')='OPEN'{where_ex}
-                        ORDER BY p.mesa;""", tuple(params)).fetchall()
-    conn.close()
-    return [int(r[0]) for r in rows if r[0] is not None]
-
-def _s2_next_global_mesa_block(default_count: int = 3, exclude_mid: int | None = None):
-    locked = _s2_get_locked_mesas(exclude_mid=exclude_mid)
-    start = int(max(locked) + 1) if locked else 1
-    return start, max(1, int(default_count or 1))
-
-
-def _s2_find_manifest_by_mesa(mesa: int):
-    _s2_migrate_staged_to_active()
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("""SELECT p.manifest_id
-                       FROM s2_page_assign p
-                       JOIN s2_manifests m ON m.id = p.manifest_id
-                       LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
-                       WHERE m.status='ACTIVE' AND p.mesa=? AND COALESCE(ms.status, 'OPEN')='OPEN'
-                       ORDER BY p.manifest_id DESC
-                       LIMIT 1;""", (int(mesa),)).fetchone()
-    conn.close()
-    return int(row[0]) if row else None
-
-def _s2_delete_manifest(mid: int):
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    mid = int(mid)
-    for tbl in ['s2_pack_ship', 's2_labels', 's2_items', 's2_sales', 's2_page_assign', 's2_files']:
-        c.execute(f"DELETE FROM {tbl} WHERE manifest_id=?;", (mid,))
-    c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
-    conn.commit()
-    conn.close()
-
-
-def _s2_migrate_staged_to_active():
-    """Compatibilidad: cualquier manifiesto STAGED con contenido pasa a ACTIVE.
-    Los STAGED vacíos de versiones anteriores se ignoran.
-    """
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id FROM s2_manifests WHERE status='STAGED';").fetchall()
-    changed = False
-    for (mid,) in rows:
-        mid = int(mid)
-        has_content = bool(c.execute("SELECT 1 FROM s2_sales WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
-        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_items WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
-        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_page_assign WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
-        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_labels WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
-        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_files WHERE manifest_id=? AND ((control_name IS NOT NULL AND TRIM(control_name)!='') OR (labels_name IS NOT NULL AND TRIM(labels_name)!=''));", (mid,)).fetchone())
-        if has_content:
-            c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (mid,))
-            changed = True
-    if changed:
-        conn.commit()
-    conn.close()
-
-
-def _s2_find_empty_active_manifest():
-    _s2_migrate_staged_to_active()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY id DESC;").fetchall()
-    out = None
-    for (mid,) in rows:
-        mid = int(mid)
-        if not _s2_manifest_has_content(mid):
-            out = mid
-            break
-    conn.close()
-    return out
-
-
-def _s2_mesas_text_from_list(mesas: list[int]) -> str:
-    mesas = sorted({int(m) for m in (mesas or []) if m is not None})
-    if not mesas:
-        return "Sin mesas"
-    if len(mesas) == 1:
-        return f"Mesa {mesas[0]}"
-    return f"Mesas {mesas[0]} a {mesas[-1]}"
-
-
-def _s2_lot_label(mid: int) -> str:
-    _s2_migrate_staged_to_active()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;").fetchall()
-    active_ids = [int(r[0]) for r in rows]
-    idx = active_ids.index(int(mid)) + 1 if int(mid) in active_ids else None
-    mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
-    conn.close()
-    block = _s2_mesas_text_from_list(mesas)
-    return f"Lote {idx} · {block}" if idx else block
-
-
-
-def _s2_zpl_underscore_decode(s: str) -> str:
-    """
-    ZPL suele venir con secuencias tipo _C3_A9 para representar bytes UTF-8.
-    Esto las convierte a texto normal (P_C3_A9rez -> Pérez).
-    """
-    if not s:
-        return ""
-    import re
-    out = []
-    buf = bytearray()
-    i = 0
-    while i < len(s):
-        if s[i] == "_" and i + 2 < len(s):
-            m = re.match(r"_([0-9A-Fa-f]{2})", s[i:])
-            if m:
-                buf.append(int(m.group(1), 16))
-                i += 3
-                continue
-        if buf:
-            try:
-                out.append(buf.decode("utf-8", errors="ignore"))
-            except Exception:
-                out.append(buf.decode("latin1", errors="ignore"))
-            buf = bytearray()
-        out.append(s[i])
-        i += 1
-    if buf:
-        try:
-            out.append(buf.decode("utf-8", errors="ignore"))
-        except Exception:
-            out.append(buf.decode("latin1", errors="ignore"))
-    return "".join(out)
-
-def _s2_parse_label_raw_info(raw: str):
-    """Extrae info visible de una etiqueta (Flex/Colecta) desde el texto raw/ZPL.
-
-    Campos:
-      - destinatario
-      - domicilio (alias: direccion)
-      - comuna (FLEX)
-      - ciudad_destino (COLECTA y a veces FLEX)
-    """
-    import re
-    if not raw:
-        return {}
-    s = str(raw).replace("\r", "\n")
-    s = _s2_zpl_underscore_decode(s)
-    info = {}
-
-    # FLEX: "Destinatario: Nombre (user)"
-    m = re.search(r"Destinatario\s*:\s*([^\n\^]{3,140})", s, flags=re.IGNORECASE)
-    if m:
-        info["destinatario"] = m.group(1).strip()
-
-    # COLECTA: línea tipo "NOMBRE (USER)"
-    if "destinatario" not in info:
-        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,120})\s*\([^\n]{2,80}\)\s*$", s, flags=re.M)
-        if m:
-            info["destinatario"] = m.group(1).strip()
-
-    # Heurística extra (FLEX/COLECTA): el destinatario suele ser la línea inmediatamente anterior a Domicilio/Direccion
-    if "destinatario" not in info:
-        m_dom = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
-        if m_dom:
-            before = s[:m_dom.start()].splitlines()
-
-            def _fd_content(line: str) -> str:
-                mm = re.search(r"\^FD(.*?)(?:\^FS|$)", line)
-                return (mm.group(1) if mm else line).strip()
-
-            prev = ""
-            for ln in reversed(before[-12:]):  # mirar hacia atrás pocas líneas
-                ln = (ln or "").strip()
-                if not ln:
-                    continue
-                cand = _fd_content(ln)
-                cand = re.sub(r"\s*\([^\)]{2,120}\)\s*$", "", cand).strip()  # recortar (USER)
-                low = cand.lower()
-                if any(k in low for k in ["pack id", "venta", "envio", "envío", "shipment", "codigo", "código", "rut", "telefono", "teléfono", "receiver zone", "domicilio", "direccion"]):
-                    continue
-                # requiere letras y largo razonable
-                if len(cand) < 3 or len(cand) > 140:
-                    continue
-                if not re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", cand):
-                    continue
-                prev = cand
-                break
-
-            if prev:
-                info["destinatario"] = prev
-
-# Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
-    m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
-    if m:
-        info["domicilio"] = m.group(2).strip()
-        # alias por compatibilidad (hay pantallas que buscan 'direccion')
-        info["direccion"] = info["domicilio"]
-
-    # Ciudad de destino (Colecta y a veces Flex)
-    m = re.search(r"Ciudad\s+de\s+destino\s*:\s*([^\n\^]{3,160})", s, flags=re.IGNORECASE)
-    if m:
-        info["ciudad_destino"] = m.group(1).strip()
-
-    # FLEX: comuna (a veces viene implícita en Domicilio "... , Comuna")
-    m = re.search(r"\bComuna\b\s*:\s*([^\n\^]{2,80})", s, flags=re.IGNORECASE)
-    if m:
-        info["comuna"] = m.group(1).strip()
-    elif info.get("domicilio"):
-        # Heurística: tomar la última sección después de coma
-        dom = info.get("domicilio", "")
-        if "," in dom:
-            comuna = dom.split(",")[-1].strip()
-            # evita capturar basura
-            if comuna and len(comuna) <= 60 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", comuna):
-                info["comuna"] = comuna
-
-    # Limpieza: jamás aceptar el mensaje promocional como destino
-    promo_re = re.compile(r"\bDespacha\s+tu[s]?\s+productos\b", re.I)
-    for k in list(info.keys()):
-        v = (info.get(k) or "").strip()
-        if v and promo_re.search(v):
-            info.pop(k, None)
-
-    return info
-def _s2_get_label_raw(mid:int, shipment_id:str):
-    conn=get_conn()
-    c=conn.cursor()
-    row=c.execute("SELECT raw FROM s2_labels WHERE manifest_id=? AND shipment_id=?;", (mid, str(shipment_id))).fetchone()
-    conn.close()
-    return row[0] if row else ""
-
-def _s2_extract_shipment_id(scan_raw: str):
-    """Lee el identificador desde el escaneo de etiqueta.
-
-    - Flex: a veces viene como JSON con {"id":"..."}
-    - Colecta: puede venir como shipment (10-15 dígitos, suele empezar por 46)
-      o como Pack ID (más largo, 10-20 dígitos)
-
-    Devuelve el mejor candidato numérico (string) o None.
-    """
-    import re, json
-    if not scan_raw:
-        return None
-    s = str(scan_raw).strip()
-
-    # 1) JSON (Flex QR)
-    if s.startswith("{") and "id" in s:
-        try:
-            obj = json.loads(s)
-            sid = obj.get("id")
-            if sid and re.fullmatch(r"\d{8,20}", str(sid)):
-                return str(sid)
-        except Exception:
-            pass
-
-    # 2) Números: extraer todos los grupos (incluye prefijos tipo >: )
-    nums = re.findall(r"(\d{6,20})", s)
-    if not nums:
-        return None
-
-    # Preferir shipment_id típico (10-15, empieza por 46) si existe
-    ship_like = [n for n in nums if 10 <= len(n) <= 15]
-    if ship_like:
-        ship_like = sorted(ship_like, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
-        return ship_like[0]
-
-    # Si no, devolver el más largo (útil si escanean Pack ID)
-    nums_sorted = sorted(nums, key=lambda x: -len(x))
-    return nums_sorted[0]
-
-
-
-def _s2_parse_control_pdf(pdf_bytes: bytes):
-    """Parse Control.pdf (Flex/Colecta) into sales with items.
-
-    Importante (Colecta): el Control a veces NO trae shipment_id al inicio de línea.
-    Por eso este parser NO exige shipment_id para contar ventas; lo completa luego
-    usando Etiquetas (por Pack ID o por shipment_id cuando venga en el Control).
-
-    Returns: list of dicts:
-      {page_no:int, shipment_id:str|None, sale_id:str, pack_id:str|None,
-       customer:str|None, destino:str|None,
-       items:[{sku:str, qty:int}]}
-    """
-    import io, re, pdfplumber
-
-    def ship_from_line(s: str):
-        # Flex suele venir como número al inicio (p.ej. 4636...)
-        m = re.match(r"^(46\d{8,13})\b", (s or "").strip())  # evita capturar códigos no-shipment (ej: 30119784...)
-        return m.group(1) if m else None
-
-    def sale_from_line(s: str):
-        m = re.search(r"\bVenta\s*:\s*(\d{10,20})\b", s or "", flags=re.IGNORECASE)
-        return m.group(1) if m else None
-
-    def pack_from_line(s: str):
-        m = re.search(r"\bPack\s*ID\s*:\s*(\d{10,20})\b", s or "", flags=re.IGNORECASE)
-        return m.group(1) if m else None
-
-    def skus_from_line(s: str):
-        # SKU puede venir con guiones/letras en algunos casos internos, pero en Control suele ser numérico
-        return re.findall(r"\bSKU\s*:\s*([0-9A-Za-z_-]{6,20})\b", s or "", flags=re.IGNORECASE)
-
-    def qty_from_line(s: str):
-        m = re.search(r"\bCantidad\s*:\s*(\d+)\b", s or "", flags=re.IGNORECASE)
-        return int(m.group(1)) if m else None
-
-    def looks_like_name(s: str):
-        s = (s or "").strip()
-        if not s or len(s) > 70:
-            return False
-        # No debe contener dígitos (evita capturar líneas tipo Venta/SKU/IDs)
-        if re.search(r"\d", s):
-            return False
-        # Evitar líneas de atributos
-        if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
-            return False
-        # Evitar palabras típicas del control
-        if re.search(r"\b(venta|sku|cantidad|pack|env[ií]o|shipment)\b", s, flags=re.I):
-            return False
-        # Debe tener letras
-        return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
-
-    def customer_from_line(s: str):
-        # Preferimos SOLO etiquetas explícitas para evitar confundir con descripción de producto.
-        m = re.search(r"\b(Cliente|Comprador|Destinatario)\s*:\s*(.+)$", s or "", flags=re.I)
-        if not m:
-            return None
-        name = (m.group(2) or "").strip()
-        name = re.sub(r"\s{2,}", " ", name)
-        return name[:70] if name else None
-
-    def destino_from_line(s: str):
-        # En el Control suele venir como "Despacha ..." o "Despacha:".
-        m = re.match(r"^Despacha\s*:\s*(.+)$", (s or "").strip(), flags=re.I)
-        if not m:
-            return None
-        dest = (m.group(1) or "").strip()
-        dest = re.sub(r"\s{2,}", " ", dest)
-        return dest[:80] if dest else None
-
-    sales = []
-    cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None,
-           "customer": None, "destino": None, "items": []}
-    sku_queue = []
-
-    def flush():
-        nonlocal cur, sku_queue
-        if cur.get("sale_id") and cur.get("items"):
-            # sale_id + items es suficiente para contar venta
-            sales.append(cur)
-        cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None,
-               "customer": None, "destino": None, "items": []}
-        sku_queue = []
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pidx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
-            for ln in lines:
-                low = ln.lower()
-                # Destino (NO saltar, guardarlo)
-                dest = destino_from_line(ln)
-                if dest and not cur.get("destino"):
-                    cur["destino"] = dest
-
-                # Cliente explícito
-                cust = customer_from_line(ln)
-                if cust and not cur.get("customer"):
-                    cur["customer"] = cust
-
-                # Algunas líneas de cabecera que no aportan
-                if low.startswith("identifi"):
-                    continue
-
-                # Flex shipment id en línea
-                ship = ship_from_line(ln)
-                if ship:
-                    if cur.get("shipment_id") and ship != cur.get("shipment_id") and cur.get("sale_id"):
-                        flush()
-                    if not cur.get("shipment_id"):
-                        cur["shipment_id"] = ship
-                        if not cur.get("page_no"):
-                            cur["page_no"] = pidx
-
-                # Pack ID (ojo: en Colecta a veces Pack+SKU viene ANTES de "Venta:",
-                # así que si aparece un Pack ID nuevo y ya tenemos una venta completa, hacemos flush aquí)
-                pid = pack_from_line(ln)
-                if pid:
-                    if cur.get("sale_id") and cur.get("items"):
-                        if (cur.get("pack_id") and pid != cur.get("pack_id")) or (cur.get("pack_id") is None):
-                            flush()
-                    cur["pack_id"] = pid
-                    if not cur.get("page_no"):
-                        cur["page_no"] = pidx
-
-
-                # Venta (si cambia, flush)
-                sid = sale_from_line(ln)
-                if sid:
-                    if cur.get("sale_id") and sid != cur.get("sale_id") and cur.get("items"):
-                        flush()
-                    cur["sale_id"] = sid
-                    if not cur.get("page_no"):
-                        cur["page_no"] = pidx
-
-                # SKU en línea
-                skus = skus_from_line(ln)
-                if skus:
-                    sku_queue.extend(skus)
-
-                # Cantidad: asigna a primer SKU pendiente
-                q = qty_from_line(ln)
-                if q is not None:
-                    if sku_queue:
-                        sku = sku_queue.pop(0)
-                        cur["items"].append({"sku": sku, "qty": int(q)})
-                else:
-                    # Cliente en línea sola (solo si aún NO hemos visto SKUs/ítems de esta venta)
-                    if (cur.get("sale_id") and not cur.get("customer")
-                            and (not sku_queue) and (not cur.get("items"))
-                            and ("sku" not in low) and ("cantidad" not in low)
-                            and (not low.startswith("despacha"))
-                            and looks_like_name(ln)):
-                        cur["customer"] = ln[:70]
-
-    flush()
-    return sales
-
-
-
-def _s2_clean_person_text(s: str, max_len: int):
-    """Limpieza defensiva para campos de persona/destino extraídos del PDF."""
-    t = (s or "").strip()
-    if not t:
-        return None
-    # Quitar fragmentos típicos que vienen pegados por extracción PDF
-    t = re.sub(r"\b(Venta|SKU|Cantidad|Pack\s*ID|Env[ií]o)\s*:\s*\S+", "", t, flags=re.I)
-    t = re.sub(r"\s{2,}", " ", t).strip(" -•|,;")
-    if not t:
-        return None
-    return t[:max_len]
-def _s2_parse_labels_txt(raw_bytes: bytes):
-    """Parsea etiquetas TXT/ZPL de Flex y Colecta.
-
-    Devuelve:
-      - pack_to_ship: dict {pack_id(str) -> shipment_id(str)}
-      - sale_to_ship: dict {sale_id(str) -> shipment_id(str)}  (fallback cuando no hay Pack ID en Control)
-      - shipment_ids: sorted list de shipment_id detectados
-
-    Nota: En Colecta el Pack ID / Venta suelen venir PARTIDOS en dos ^FD:
-        ^FDPack ID: 20000^FS  y luego ^FD1128....^FS  -> 200001128....
-        ^FDVenta: 20000^FS    y luego ^FD1498....^FS  -> 200001498....
-    """
-    import re
-
-    try:
-        txt = raw_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        txt = str(raw_bytes)
-
-    # separar etiquetas por bloque ^XA ... ^XZ
-    blocks = re.split(r"\^XA", txt)
-    pack_to_ship = {}
-    sale_to_ship = {}
-    shipment_ids = set()
-
-    def clean_num(s):
-        return re.sub(r"\D", "", s or "")
-
-    def rebuild_split_id(kind: str, b: str):
-        """
-        kind: 'Pack' o 'Venta'
-        Busca:
-          - Completo:  kind ID: 2000011363....
-          - Partido:   kind ID: 20000  + siguiente ^FD 11363....
-        """
-        kind_re = kind
-        full = None
-
-        m_full = re.search(rf"{kind_re}\s*(?:ID)?\s*:\s*(\d{{10,20}})", b, flags=re.I)
-        if m_full:
-            full = clean_num(m_full.group(1))
-
-        if not full:
-            m_part = re.search(rf"{kind_re}\s*(?:ID)?\s*:\s*(\d{{4,10}})\s*\^FS", b, flags=re.I)
-            if m_part:
-                head = clean_num(m_part.group(1))
-                tailm = re.search(r"\^FD\s*([0-9 ]{6,20})\s*\^FS", b[m_part.end():])
-                if tailm:
-                    tail = clean_num(tailm.group(1))
-                    cand = head + tail
-                    if 10 <= len(cand) <= 20:
-                        full = cand
-        return full
-
-    for b in blocks:
-        if not b.strip():
-            continue
-
-        pack_full = rebuild_split_id("Pack", b)
-        sale_full = rebuild_split_id("Venta", b)
-
-        # shipment id: preferir JSON con "id":"4638..."
-        ship = None
-        jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", b)
-        if jm:
-            ship = jm.group(1)
-
-        if not ship:
-            # buscar números candidatos, priorizando 10-15 dígitos y que empiecen por 46
-            nums = re.findall(r"\b\d{10,15}\b", b)
-            if nums:
-                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
-                ship = nums_sorted[0]
-
-        if ship:
-            shipment_ids.add(ship)
-            if pack_full:
-                pack_to_ship[str(pack_full)] = str(ship)
-            if sale_full:
-                sale_to_ship[str(sale_full)] = str(ship)
-
-    return pack_to_ship, sale_to_ship, sorted(shipment_ids)
-
-def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
-    pages_sales = _s2_parse_control_pdf(pdf_bytes)
-    conn = get_conn()
-    c = conn.cursor()
-    # store file
-    c.execute("""INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
-                 VALUES(?, ?, ?, ?)
-                 ON CONFLICT(manifest_id) DO UPDATE SET
-                    control_pdf=excluded.control_pdf,
-                    control_name=excluded.control_name,
-                    updated_at=excluded.updated_at;""", (mid, pdf_bytes, pdf_name, _s2_now_iso()))
-    # clear previous parsed sales/items
-    c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
-    c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
-
-    n_sales = 0
-    page_counters = {}
-    for s in pages_sales:
-        sale_id = str(s.get("sale_id") or "")
-        if not sale_id:
-            continue
-        n_sales += 1
-        shipment_id = s.get("shipment_id")
-        page_no = int(s.get("page_no") or 1)
-        pack_id = s.get("pack_id")
-        row_no = int(page_counters.get(page_no, 0) + 1)
-        page_counters[page_no] = row_no
-        customer = _s2_clean_person_text(s.get("customer"), 70)
-        destino = _s2_clean_person_text(s.get("destino"), 80)
-
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer, destino)
-                     VALUES(?,?,?,?,?, 'NEW', ?, ?, ?)
-                     ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
-                        shipment_id=excluded.shipment_id,
-                        page_no=excluded.page_no,
-                        status='NEW',
-                        mesa=NULL,
-                        opened_at=NULL,
-                        closed_at=NULL,
-                        pack_id=excluded.pack_id,
-                        customer=excluded.customer,
-                        destino=excluded.destino;""",
-                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no, row_no,
-                   (str(pack_id) if pack_id else None), (str(customer) if customer else None),
-                   (str(destino) if destino else None)))
-
-        for it in s.get("items", []):
-            try:
-                sku = str(it.get("sku"))
-                qty = int(it.get("qty") or 0)
-            except Exception:
-                continue
-            if not sku or qty <= 0:
-                continue
-            c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
-                         VALUES(?,?,?,?,?,0,'PENDING')
-                         ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
-                            description=excluded.description,
-                            qty=excluded.qty,
-                            picked=0,
-                            status='PENDING';""", (mid, sale_id, sku, it.get("desc",""), qty))
-
-    conn.commit()
-    conn.close()
-    return n_sales
-
-
-
-def _s2_get_max_page(mid: int) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT MAX(page_no) FROM s2_sales WHERE manifest_id=?;", (mid,))
-    v = c.fetchone()[0]
-    conn.close()
-    try:
-        return int(v or 0)
-    except Exception:
-        return 0
-
-
-def _s2_append_control(mid: int, pdf_name: str, pdf_bytes: bytes, page_offset: int = 0) -> int:
-    """Append a control PDF into an existing manifest, offsetting page numbers to avoid mixing."""
-    pages_sales = _s2_parse_control_pdf(pdf_bytes)
-    conn = get_conn()
-    c = conn.cursor()
-
-    n_sales = 0
-    page_counters = {}
-    for s in pages_sales:
-        sale_id = str(s.get("sale_id") or "")
-        if not sale_id:
-            continue
-        n_sales += 1
-        shipment_id = s.get("shipment_id")
-        raw_page_no = int(s.get("page_no") or 1)
-        page_no = int(raw_page_no + int(page_offset or 0))
-        pack_id = s.get("pack_id")
-        row_no = int(page_counters.get(page_no, 0) + 1)
-        page_counters[page_no] = row_no
-        customer = _s2_clean_person_text(s.get("customer"), 70)
-        destino = _s2_clean_person_text(s.get("destino"), 80)
-
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer, destino)
-                     VALUES(?,?,?,?,?, 'NEW', ?, ?, ?)
-                     ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
-                        shipment_id=excluded.shipment_id,
-                        page_no=excluded.page_no,
-                        status='NEW',
-                        mesa=NULL,
-                        opened_at=NULL,
-                        closed_at=NULL,
-                        pack_id=excluded.pack_id,
-                        customer=excluded.customer,
-                        destino=excluded.destino;""",
-                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no, row_no,
-                   (str(pack_id) if pack_id else None), (str(customer) if customer else None),
-                   (str(destino) if destino else None)))
-
-        for it in s.get("items", []):
-            try:
-                sku = str(it.get("sku"))
-                qty = int(it.get("qty") or 0)
-            except Exception:
-                continue
-            if not sku or qty <= 0:
-                continue
-            c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
-                         VALUES(?,?,?,?,?,0,'PENDING')
-                         ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
-                            description=excluded.description,
-                            qty=excluded.qty,
-                            picked=0,
-                            status='PENDING';""", (mid, sale_id, sku, it.get("desc",""), qty))
-
-    conn.commit()
-    conn.close()
-    return n_sales
-
-
-
-def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
-    # Detectar ship ids y relaciones pack/venta -> ship
-    pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
-
-    try:
-        txt = labels_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        txt = str(labels_bytes)
-
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
-                 VALUES(?, ?, ?, ?)
-                 ON CONFLICT(manifest_id) DO UPDATE SET
-                    labels_txt=excluded.labels_txt,
-                    labels_name=excluded.labels_name,
-                    updated_at=excluded.updated_at;""", (mid, labels_bytes, labels_name, _s2_now_iso()))
-
-    # limpiar y reinsertar shipment ids
-    c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
-    for sid in shipment_ids:
-        c.execute("INSERT OR REPLACE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
-
-    # guardar pack->ship para Colecta
-    if pack_to_ship:
-        for pack_id, ship_id in pack_to_ship.items():
-            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);",
-                      (mid, str(pack_id), str(ship_id)))
-
-        # completar shipment_id en ventas usando pack_id si falta
-        try:
-            c.execute("""UPDATE s2_sales
-                           SET shipment_id = (
-                               SELECT ps.shipment_id FROM s2_pack_ship ps
-                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
-                           )
-                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
-        except Exception:
-            pass
-
-    # fallback: completar shipment_id por sale_id (cuando el Control no trae Pack ID)
-    if sale_to_ship:
-        try:
-            for sale_id, ship_id in sale_to_ship.items():
-                c.execute("""UPDATE s2_sales
-                             SET shipment_id=?
-                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""",
-                          (str(ship_id), mid, str(sale_id)))
-        except Exception:
-            pass
-
-    # Guardar RAW por shipment_id y derivar Cliente/Destino desde la etiqueta (Flex/Colecta)
-    import re
-    blocks = re.split(r"\^XA", txt)
-    for b in blocks:
-        if not b.strip():
-            continue
-        raw_block = "^XA" + b
-
-        ship = None
-        jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", raw_block)
-        if jm:
-            ship = jm.group(1)
-        if not ship:
-            nums = re.findall(r"\b\d{10,15}\b", raw_block)
-            if nums:
-                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
-                ship = nums_sorted[0]
-        if not ship:
-            continue
-
-        # guardar raw completo
-        c.execute("""UPDATE s2_labels SET raw=? WHERE manifest_id=? AND shipment_id=?;""",
-                  (raw_block, mid, str(ship)))
-
-        info = _s2_parse_label_raw_info(raw_block)
-        if not info:
-            continue
-
-        customer = _s2_clean_person_text(info.get("destinatario"), 70)
-
-        destino_parts = []
-        dom = _s2_clean_person_text(info.get("domicilio"), 120)
-        city = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-        if dom:
-            destino_parts.append(dom)
-        if city:
-            destino_parts.append(city)
-        destino = " - ".join([p for p in destino_parts if p]) if destino_parts else None
-        destino = _s2_clean_person_text(destino, 160) if destino else None
-
-        # actualizar ventas por shipment_id
-        comuna = _s2_clean_person_text(info.get("comuna"), 60)
-        ciudad_dest = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-
-        fields = []
-        params = []
-        if customer:
-            fields.append("customer=?")
-            params.append(customer)
-        if destino:
-            fields.append("destino=?")
-            params.append(destino)
-        if comuna:
-            fields.append("comuna=?")
-            params.append(comuna)
-        if ciudad_dest:
-            fields.append("ciudad_destino=?")
-            params.append(ciudad_dest)
-
-        if fields:
-            params.extend([mid, str(ship)])
-            c.execute(f"""UPDATE s2_sales
-                             SET {', '.join(fields)}
-                             WHERE manifest_id=? AND shipment_id=?;""", tuple(params))
-    conn.commit()
-    conn.close()
-    return len(shipment_ids)
-
-def _s2_get_stats(mid: int):
-    """
-    Stats del manifiesto (Sorting v2).
-    Incluye aliases para UI: ventas/items/etiquetas/... para evitar KeyError.
-    Tolerante a cambios de esquema.
-    """
-    conn = get_conn()
-    c = conn.cursor()
-
-    def has_col(table: str, col: str) -> bool:
-        try:
-            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table});").fetchall()]
-            return col in cols
-        except Exception:
-            return False
-
-    stats = {}
-
-    # Core counts
-    sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
-    items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
-    labels_total = int(c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
-
-    sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status='PENDING';", (mid,)).fetchone()[0] or 0)
-    sales_done    = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status='DONE';", (mid,)).fetchone()[0] or 0)
-
-    items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (mid,)).fetchone()[0] or 0)
-    items_done    = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='DONE';", (mid,)).fetchone()[0] or 0)
-    items_incid   = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='INCIDENCE';", (mid,)).fetchone()[0] or 0)
-
-    # Labels with shipment_id
-    if has_col("s2_labels", "shipment_id"):
-        labels_with_ship = int(c.execute(
-            "SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-        distinct_ship_labels = int(c.execute(
-            "SELECT COUNT(DISTINCT shipment_id) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-    else:
-        labels_with_ship = 0
-        distinct_ship_labels = 0
-
-    # Pack ID availability
-    # In control, pack_id usually lives in s2_sales.pack_id (not in labels).
-    sales_with_pack = 0
-    distinct_packs = 0
-    if has_col("s2_sales", "pack_id"):
-        sales_with_pack = int(c.execute(
-            "SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-        distinct_packs = int(c.execute(
-            "SELECT COUNT(DISTINCT pack_id) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-
-    labels_with_pack = 0
-    if has_col("s2_labels", "pack_id"):
-        labels_with_pack = int(c.execute(
-            "SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-
-    labels_with_sale = 0
-    if has_col("s2_labels", "sale_id"):
-        labels_with_sale = int(c.execute(
-            "SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND sale_id IS NOT NULL AND sale_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-
-    # Sales with shipment_id (after matching)
-    if has_col("s2_sales", "shipment_id"):
-        sales_with_ship = int(c.execute(
-            "SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-    else:
-        sales_with_ship = 0
-
-    missing_ship = sales_total - sales_with_ship
-
-    # Matches by pack (if mapping table exists)
-    matched_by_pack = 0
-    if "s2_pack_ship" in [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]:
-        matched_by_pack = int(c.execute(
-            "SELECT COUNT(DISTINCT pack_id) FROM s2_pack_ship WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!='' AND shipment_id IS NOT NULL AND shipment_id!='';",
-            (mid,)
-        ).fetchone()[0] or 0)
-
-    # Fill canonical keys
-    stats.update({
-        "sales_total": sales_total,
-        "sales_pending": sales_pending,
-        "sales_done": sales_done,
-        "items_total": items_total,
-        "items_pending": items_pending,
-        "items_done": items_done,
-        "items_incidence": items_incid,
-        "labels_total": labels_total,
-        "labels_with_ship": labels_with_ship,
-        "labels_unique_ship": distinct_ship_labels,
-        "sales_with_pack": sales_with_pack,
-        "distinct_packs": distinct_packs,
-        "sales_with_ship": sales_with_ship,
-        "sales_missing_ship": missing_ship,
-        "labels_with_pack": labels_with_pack,
-        "labels_with_sale": labels_with_sale,
-        "matched_by_pack": matched_by_pack,
-    })
-
-    # Aliases expected by UI (legacy naming)
-    stats.update({
-        "ventas": sales_total,
-        "items": items_total,
-        "etiquetas": labels_total,
-        "distinct_ship_labels": distinct_ship_labels,
-        "ventas_with_pack": sales_with_pack,
-        "ventas_with_ship": sales_with_ship,
-        "missing_ship": missing_ship,
-        "matched_by_pack": matched_by_pack,
-    })
-
-    conn.close()
-    return stats
-
-def _s2_reset_all_sorting():
-    """Hard reset of Sorting module only (keeps other modules intact)."""
-    conn = get_conn()
-    c = conn.cursor()
-    # New (s2_*) tables (some deployments may not have all of them yet)
-    s2_tables = [
-        "s2_page_assign",
-        "s2_pack_ship",
-        "s2_labels",
-        "s2_items",
-        "s2_sales",
-        "s2_files",
-        "s2_manifests",
-    ]
-    for t in s2_tables:
-        try:
-            c.execute(f"DELETE FROM {t};")
-        except Exception:
-            # table may not exist in older DBs
-            pass
-    conn.commit()
-    conn.close()
-
-
-def _s2_get_pages(mid:int):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT DISTINCT page_no FROM s2_sales WHERE manifest_id=? ORDER BY page_no;", (mid,))
-    pages=[int(r[0]) for r in c.fetchall()]
-    conn.close()
-    return pages
-
-def _s2_auto_assign_pages(mid:int, num_mesas:int=10):
-    pages=_s2_get_pages(mid)
-    if not pages:
-        return 0
-    conn=get_conn()
-    c=conn.cursor()
-    for i,p in enumerate(pages):
-        mesa = (i % num_mesas) + 1
-        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, p, mesa))
-    conn.commit()
-    conn.close()
-    return len(pages)
-
-def _s2_next_mesa_block(mid: int, default_count: int = 3):
-    assigns = _s2_get_assignments(mid)
-    if not assigns:
-        return 1, int(default_count)
-    mesas = sorted({int(m) for _, m in assigns if m is not None})
-    mesas_count = int(len(mesas) or default_count)
-    next_start = int(max(mesas) + 1) if mesas else 1
-    return next_start, mesas_count
-
-
-def _s2_auto_assign_specific_pages(mid: int, pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
-    pages = [int(p) for p in pages or []]
-    if not pages:
-        return 0
-    mesas_count = max(1, int(mesas_count or 1))
-    start_mesa = max(1, int(start_mesa or 1))
-    conn = get_conn()
-    c = conn.cursor()
-    for i, p in enumerate(sorted(set(pages))):
-        mesa = start_mesa + (i % mesas_count)
-        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, p, mesa))
-    conn.commit()
-    conn.close()
-    return len(set(pages))
-
-
-def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
-    pages = sorted({int(p) for p in (pages or [])})
-    mesas_count = max(1, int(mesas_count or 1))
-    start_mesa = max(1, int(start_mesa or 1))
-    preview = []
-    for i, p in enumerate(pages):
-        preview.append({"Página": int(p), "Mesa": int(start_mesa + (i % mesas_count))})
-    return preview
-
-
-def _s2_build_default_page_assignment(pages: list[int], exclude_mid: int | None = None):
-    pages = sorted({int(p) for p in (pages or [])})
-    locked = set(_s2_get_locked_mesas(exclude_mid=exclude_mid))
-    used = set()
-    current = 1
-    mapping = {}
-    for p in pages:
-        while current in locked or current in used:
-            current += 1
-        mapping[int(p)] = int(current)
-        used.add(int(current))
-        current += 1
-    return mapping
-
-
-def _s2_render_assignment_editor(pages: list[int], widget_prefix: str, exclude_mid: int | None = None):
-    pages = sorted({int(p) for p in (pages or [])})
-    locked = set(_s2_get_locked_mesas(exclude_mid=exclude_mid))
-    defaults = _s2_build_default_page_assignment(pages, exclude_mid=exclude_mid)
-
-    assignments = {}
-    warnings = []
-    if not pages:
-        return assignments, warnings, locked
-
-    st.markdown("**Asignación manual Página → Mesa**")
-    st.caption("Define exactamente qué página irá a qué mesa. Las mesas bloqueadas por trabajo activo no se pueden reutilizar.")
-
-    seen_mesas = {}
-    for p in pages:
-        key = f"{widget_prefix}_page_{int(p)}"
-        default_mesa = int(st.session_state.get(key, defaults.get(int(p), 1)))
-        mesa = st.number_input(
-            f"Página {int(p)} → Mesa",
-            min_value=1,
-            max_value=200,
-            value=default_mesa,
-            step=1,
-            key=key,
-        )
-        mesa = int(mesa)
-        assignments[int(p)] = mesa
-
-        if mesa in locked:
-            warnings.append(f"La mesa {mesa} está bloqueada por un lote activo.")
-        if mesa in seen_mesas:
-            warnings.append(f"La mesa {mesa} está repetida en las páginas {seen_mesas[mesa]} y {int(p)}.")
-        else:
-            seen_mesas[mesa] = int(p)
-
-    return assignments, warnings, locked
-
-
-def _s2_apply_page_assignments(mid: int, page_to_mesa: dict[int, int]):
-    page_to_mesa = {int(p): int(m) for p, m in (page_to_mesa or {}).items()}
-    if not page_to_mesa:
-        return 0
-    conn = get_conn()
-    c = conn.cursor()
-    for p, mesa in sorted(page_to_mesa.items()):
-        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (int(mid), int(p), int(mesa)))
-    conn.commit()
-    conn.close()
-    return len(page_to_mesa)
-
-
-def _s2_preview_batch_pages(pdfs):
-    preview_pages = []
-    running_offset = 0
-    for pdf in (pdfs or []):
-        try:
-            parsed = _s2_parse_control_pdf(pdf.getvalue())
-            pages_local = sorted({int(r.get("page_no") or 1) for r in parsed})
-        except Exception:
-            pages_local = []
-        for p in pages_local:
-            preview_pages.append(int(p) + int(running_offset))
-        if pages_local:
-            running_offset += max(pages_local)
-    return sorted({int(p) for p in preview_pages})
-
-
-def _s2_close_mesa(mid: int, mesa: int):
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    pending = int(c.execute("""SELECT COUNT(*)
-                               FROM s2_sales
-                               WHERE manifest_id=? AND mesa=? AND status!='DONE';""", (int(mid), int(mesa))).fetchone()[0] or 0)
-    if pending > 0:
-        conn.close()
-        return False, f"La mesa {int(mesa)} todavía tiene {pending} venta(s) pendiente(s)."
-
-    c.execute("""INSERT INTO s2_mesa_status(manifest_id, mesa, status, closed_at)
-                 VALUES(?,?, 'CLOSED', ?)
-                 ON CONFLICT(manifest_id, mesa) DO UPDATE SET
-                    status='CLOSED',
-                    closed_at=excluded.closed_at;""", (int(mid), int(mesa), _s2_now_iso()))
-
-    open_rows = c.execute("""SELECT DISTINCT p.mesa
-                             FROM s2_page_assign p
-                             LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
-                             WHERE p.manifest_id=? AND COALESCE(ms.status, 'OPEN')='OPEN';""", (int(mid),)).fetchall()
-    if not open_rows:
-        c.execute("UPDATE s2_manifests SET status='DONE' WHERE id=?;", (int(mid),))
-
-    conn.commit()
-    conn.close()
-    return True, None
-
-
-def _s2_is_mesa_closed(mid: int, mesa: int) -> bool:
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("""SELECT status
-                       FROM s2_mesa_status
-                       WHERE manifest_id=? AND mesa=?;""", (int(mid), int(mesa))).fetchone()
-    conn.close()
-    return bool(row and str(row[0]).upper() == 'CLOSED')
-
-
-def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
-    pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
-    try:
-        txt = labels_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        txt = str(labels_bytes)
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    prev = c.execute("SELECT labels_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
-    prev_name = str(prev[0] or "").strip() if prev else ""
-    merged_name = labels_name if not prev_name else f"{prev_name} + {labels_name}"
-
-    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
-                 VALUES(?, ?, ?, ?)
-                 ON CONFLICT(manifest_id) DO UPDATE SET
-                    labels_name=excluded.labels_name,
-                    updated_at=excluded.updated_at;""", (mid, labels_bytes, merged_name, _s2_now_iso()))
-
-    for sid in shipment_ids:
-        c.execute("INSERT OR IGNORE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
-
-    if pack_to_ship:
-        for pack_id, ship_id in pack_to_ship.items():
-            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);", (mid, str(pack_id), str(ship_id)))
-        try:
-            c.execute("""UPDATE s2_sales
-                           SET shipment_id = (
-                               SELECT ps.shipment_id FROM s2_pack_ship ps
-                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
-                           )
-                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
-        except Exception:
-            pass
-
-    if sale_to_ship:
-        try:
-            for sale_id, ship_id in sale_to_ship.items():
-                c.execute("""UPDATE s2_sales
-                             SET shipment_id=?
-                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""",
-                          (str(ship_id), mid, str(sale_id)))
-        except Exception:
-            pass
-
-    import re
-    blocks = re.split(r"\^XA", txt)
-    for b in blocks:
-        if not b.strip():
-            continue
-        raw_block = "^XA" + b
-
-        ship = None
-        jm = re.search(r'"id"\s*:\s*"(\d{8,15})"', raw_block)
-        if jm:
-            ship = jm.group(1)
-        if not ship:
-            nums = re.findall(r"\b\d{10,15}\b", raw_block)
-            if nums:
-                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
-                ship = nums_sorted[0]
-        if not ship:
-            continue
-
-        c.execute("""UPDATE s2_labels SET raw=? WHERE manifest_id=? AND shipment_id=?;""", (raw_block, mid, str(ship)))
-        info = _s2_parse_label_raw_info(raw_block)
-        if not info:
-            continue
-        customer = _s2_clean_person_text(info.get("destinatario"), 70)
-        destino_parts = []
-        dom = _s2_clean_person_text(info.get("domicilio"), 120)
-        city = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-        if dom:
-            destino_parts.append(dom)
-        if city:
-            destino_parts.append(city)
-        destino = " - ".join([p for p in destino_parts if p]) if destino_parts else None
-        destino = _s2_clean_person_text(destino, 160) if destino else None
-        comuna = _s2_clean_person_text(info.get("comuna"), 60)
-        ciudad_dest = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-        fields, params = [], []
-        if customer:
-            fields.append("customer=?")
-            params.append(customer)
-        if destino:
-            fields.append("destino=?")
-            params.append(destino)
-        if comuna:
-            fields.append("comuna=?")
-            params.append(comuna)
-        if ciudad_dest:
-            fields.append("ciudad_destino=?")
-            params.append(ciudad_dest)
-        if fields:
-            params.extend([mid, str(ship)])
-            c.execute(f"""UPDATE s2_sales
-                             SET {', '.join(fields)}
-                             WHERE manifest_id=? AND shipment_id=?;""", tuple(params))
-
-    conn.commit()
-    conn.close()
-    return len(shipment_ids)
-
-
-def _s2_get_assignments(mid:int):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY page_no;", (mid,))
-    rows=[(int(r[0]), int(r[1])) for r in c.fetchall()]
-    conn.close()
-    return rows
-
-def _s2_set_assignment(mid:int, page_no:int, mesa:int):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                 VALUES(?,?,?)
-                 ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, int(page_no), int(mesa)))
-    conn.commit()
-    conn.close()
-
-def _s2_create_corridas(mid:int):
-    # apply mesa from page assignments to sales y liberar a producción
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-    page_to_mesa = {int(p): int(m) for p,m in c.fetchall()}
-
-    mesas_assigned = sorted({int(m) for m in page_to_mesa.values() if m is not None})
-    for mesa in mesas_assigned:
-        c.execute("""INSERT INTO s2_mesa_status(manifest_id, mesa, status, closed_at)
-                     VALUES(?,?, 'OPEN', NULL)
-                     ON CONFLICT(manifest_id, mesa) DO UPDATE SET
-                        status='OPEN',
-                        closed_at=NULL;""", (int(mid), int(mesa)))
-
-    # update sales
-    c.execute("SELECT sale_id, page_no FROM s2_sales WHERE manifest_id=?;", (mid,))
-    sales = c.fetchall()
-    updated=0
-    for sale_id, page_no in sales:
-        mesa = page_to_mesa.get(int(page_no))
-        if mesa is None:
-            continue
-        c.execute("""UPDATE s2_sales
-                     SET mesa=?, status='PENDING', opened_at=NULL, closed_at=NULL
-                     WHERE manifest_id=? AND sale_id=?;""", (mesa, mid, sale_id))
-        updated += 1
-    c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (int(mid),))
-    conn.commit()
-    conn.close()
-    return updated
-
-def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
-    """Devuelve la próxima venta pendiente (secuencia obligatoria) para una mesa,
-    ordenada por página y luego por sale_id (orden estable)."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""SELECT sale_id, shipment_id, pack_id, page_no
-                 FROM s2_sales
-                 WHERE manifest_id=? AND mesa=? AND status='PENDING'
-                 ORDER BY page_no, row_no, sale_id
-                 LIMIT 1;""", (mid, int(mesa)))
-    row = c.fetchone()
-    conn.close()
-    return row  # (sale_id, shipment_id, pack_id, page_no) o None
-
-
-
-def _s2_table_columns(table: str) -> set:
-    conn = get_conn()
-    try:
-        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table});").fetchall()}
-    except Exception:
-        return set()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _s2_pick_col(cols: set, *names: str, default_sql: str = "NULL") -> str:
-    """Devuelve una expresión SQL segura para columnas antiguas/nuevas."""
-    for name in names:
-        if name in cols:
-            return '"' + name.replace('"', '""') + '"'
-    return default_sql
-
-def _s2_next_pending_item(mid:int, sale_id:str):
-    """Devuelve el próximo producto pendiente de una venta sin asumir esquema fijo.
-
-    Motivo: en Streamlit Cloud puede existir una DB antigua donde s2_items no trae
-    exactamente sku/description/qty/picked/status. Esta consulta detecta columnas
-    disponibles y usa equivalentes o valores por defecto, evitando OperationalError.
-    """
-    try:
-        _s2_ensure_items_schema_runtime()
-    except Exception:
-        pass
-
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        cols = {str(r[1]) for r in c.execute("PRAGMA table_info(s2_items);").fetchall()}
-        if not cols:
-            return None
-
-        col_mid = _s2_pick_col(cols, "manifest_id", "mid", default_sql="NULL")
-        col_sale = _s2_pick_col(cols, "sale_id", "venta_id", "order_id", "ml_order_id", default_sql="NULL")
-        col_sku = _s2_pick_col(cols, "sku", "sku_ml", "codigo_sku", default_sql="NULL")
-        col_desc = _s2_pick_col(cols, "description", "descripcion", "title_ml", "title_tec", "title", "producto", default_sql="''")
-        col_qty = _s2_pick_col(cols, "qty", "cantidad", "qty_total", "unidades", default_sql="0")
-        col_picked = _s2_pick_col(cols, "picked", "qty_picked", "verificado", default_sql="0")
-        col_status = _s2_pick_col(cols, "status", "estado", default_sql="'PENDING'")
-
-        if col_mid == "NULL" or col_sale == "NULL" or col_sku == "NULL":
-            return None
-
-        sql = f"""
-            SELECT
-                CAST({col_sku} AS TEXT) AS sku,
-                CAST({col_desc} AS TEXT) AS description,
-                COALESCE(CAST({col_qty} AS INTEGER), 0) AS qty,
-                COALESCE(CAST({col_picked} AS INTEGER), 0) AS picked,
-                COALESCE(CAST({col_status} AS TEXT), 'PENDING') AS status
-            FROM s2_items
-            WHERE CAST({col_mid} AS INTEGER)=?
-              AND CAST({col_sale} AS TEXT)=?
-              AND COALESCE(CAST({col_sku} AS TEXT), '') <> ''
-              AND COALESCE(CAST({col_status} AS TEXT), 'PENDING') NOT IN ('DONE','INCIDENCE')
-            ORDER BY sku
-            LIMIT 1;
-        """
-        return c.execute(sql, (int(mid), str(sale_id))).fetchone()
-    except sqlite3.OperationalError:
-        # Último seguro: no botar la app. La mesa queda sin ítem hasta recargar/manifiesto nuevo.
-        return None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _s2_sale_items(mid:int, sale_id:str):
-    try:
-        _s2_ensure_items_schema_runtime()
-    except Exception:
-        pass
-    conn=get_conn()
-    c=conn.cursor()
-    try:
-        cols = {str(r[1]) for r in c.execute("PRAGMA table_info(s2_items);").fetchall()}
-        if not cols:
-            return []
-        col_mid = _s2_pick_col(cols, "manifest_id", "mid", default_sql="NULL")
-        col_sale = _s2_pick_col(cols, "sale_id", "venta_id", "order_id", "ml_order_id", default_sql="NULL")
-        col_sku = _s2_pick_col(cols, "sku", "sku_ml", "codigo_sku", default_sql="NULL")
-        col_desc = _s2_pick_col(cols, "description", "descripcion", "title_ml", "title_tec", "title", "producto", default_sql="''")
-        col_qty = _s2_pick_col(cols, "qty", "cantidad", "qty_total", "unidades", default_sql="0")
-        col_picked = _s2_pick_col(cols, "picked", "qty_picked", "verificado", default_sql="0")
-        col_status = _s2_pick_col(cols, "status", "estado", default_sql="'PENDING'")
-        if col_mid == "NULL" or col_sale == "NULL" or col_sku == "NULL":
-            return []
-        sql = f"""
-            SELECT CAST({col_sku} AS TEXT) AS sku,
-                   CAST({col_desc} AS TEXT) AS description,
-                   COALESCE(CAST({col_qty} AS INTEGER), 0) AS qty,
-                   COALESCE(CAST({col_picked} AS INTEGER), 0) AS picked,
-                   COALESCE(CAST({col_status} AS TEXT), 'PENDING') AS status
-            FROM s2_items
-            WHERE CAST({col_mid} AS INTEGER)=? AND CAST({col_sale} AS TEXT)=?
-            ORDER BY sku;
-        """
-        return c.execute(sql, (int(mid), str(sale_id))).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    finally:
-        conn.close()
-
-def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
-    _s2_ensure_items_schema_runtime()
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""SELECT qty, picked FROM s2_items
-                 WHERE manifest_id=? AND sale_id=? AND sku=?;""", (mid, sale_id, sku))
-    row=c.fetchone()
-    if not row:
-        conn.close()
-        return False, "SKU no pertenece a esta venta"
-    qty, picked = int(row[0]), int(row[1])
-    new_picked = min(qty, picked + int(add_qty))
-    status = "DONE" if new_picked >= qty else "PENDING"
-    c.execute("""UPDATE s2_items SET picked=?, status=? WHERE manifest_id=? AND sale_id=? AND sku=?;""", 
-              (new_picked, status, mid, sale_id, sku))
-    # if all done, allow close
-    conn.commit()
-    conn.close()
-    return True, None
-
-
-def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
-    _s2_ensure_items_schema_runtime()
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("UPDATE s2_items SET status='INCIDENCE', confirm_mode='INCIDENCE', updated_at=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (_s2_now_iso(), mid, sale_id, sku))
-    conn.commit()
-    conn.close()
-
-
-def _s2_mark_shortage(mid:int, sale_id:str, sku:str, missing_qty:int, note:str=""):
-    """Marca un producto como terminado con faltante parcial o total.
-
-    Regla operativa Sorting/Camarero:
-    - El operador escanea una sola vez para validar producto.
-    - Luego cuenta físicamente y selecciona cuántas unidades faltan.
-    - Si faltan menos que el total, deja picked = qty - faltante.
-    - El estado queda INCIDENCE para cerrar el producto con evidencia de faltante.
-    """
-    _s2_ensure_items_schema_runtime()
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT qty, picked FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
-    row=c.fetchone()
-    if not row:
-        conn.close()
-        return False, "SKU no pertenece a esta venta"
-    qty=int(row[0] or 0)
-    missing=max(1, min(int(missing_qty or 1), qty))
-    verified=max(0, qty-missing)
-    note_txt = (note or f"Faltante declarado por operador: faltan {missing} de {qty}").strip()
-    c.execute("""UPDATE s2_items
-                 SET picked=?, status='INCIDENCE', confirm_mode='SHORTAGE', updated_at=?
-                 WHERE manifest_id=? AND sale_id=? AND sku=?;""",
-              (verified, _s2_now_iso(), mid, sale_id, sku))
-    # Si existe tabla de incidencias de sorting en futuras versiones, no dependemos de ella aquí.
-    conn.commit()
-    conn.close()
-    return True, None
-
-def _s2_force_done_no_ean(mid:int, sale_id:str, sku:str):
-    _s2_ensure_items_schema_runtime()
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT qty, picked FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
-    row=c.fetchone()
-    if not row:
-        conn.close()
-        return False
-    qty=int(row[0] or 0)
-    c.execute("UPDATE s2_items SET picked=?, status='DONE', confirm_mode='MANUAL_NO_EAN', updated_at=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (qty, _s2_now_iso(), mid, sale_id, sku))
-    conn.commit()
-    conn.close()
-    return True
-
-def _s2_is_sale_done(mid:int, sale_id:str):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""SELECT COUNT(1) FROM s2_items WHERE manifest_id=? AND sale_id=? AND status NOT IN ('DONE','INCIDENCE');""", (mid, sale_id))
-    rem=int(c.fetchone()[0] or 0)
-    conn.close()
-    return rem==0
-
-def _s2_close_sale(mid:int, sale_id:str):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""UPDATE s2_sales SET status='DONE', closed_at=? WHERE manifest_id=? AND sale_id=?;""", (_s2_now_iso(), mid, sale_id))
-    conn.commit()
-    conn.close()
-
-
-
 # =========================
-# DOCUMENTOS DE DESPACHO FLEX - KAME Y ETIQUETAS
+# 5) MANIFIESTOS Y ETIQUETAS - DOCUMENTOS DE TANDAS PICKING
 # =========================
-def _s2_list_dispatch_manifests():
-    """Permite documentos tanto de lotes activos como cerrados, sin alterar estados."""
-    _s2_create_tables()
-    conn = get_conn()
-    try:
-        rows = conn.execute("""
-            SELECT m.id, m.status, m.created_at, COUNT(s.sale_id)
-              FROM s2_manifests m
-              JOIN s2_sales s ON s.manifest_id=m.id
-             WHERE m.status IN ('ACTIVE','DONE')
-             GROUP BY m.id, m.status, m.created_at
-             ORDER BY m.created_at DESC, m.id DESC
-        """).fetchall()
-    finally:
-        conn.close()
-    return [
-        {"id": int(mid), "label": f"Lote #{mid} · {count} ventas · "
-         f"{'Activo' if status == 'ACTIVE' else 'Cerrado'}", "estado": status}
-        for mid, status, created, count in rows
-    ]
-
-
-def _s2_despacho_data(manifest_ids: list[int], inv_map_sku: dict) -> dict:
-    """Busca datos SOLO de los lotes elegidos; no cambia su estado en la BD."""
-    from despacho_kame import _is_printable_zpl
-
-    if not manifest_ids:
-        return {"ventas": [], "etiquetas_zpl": [], "faltantes": [], "skus_sin_kame": [], "envios_duplicados": []}
-    conn = get_conn()
-    ventas = []
-    zpl = []
-    missing = []
-    unknown = set()
-    duplicates = []
-    seen_shipments = set()
-    try:
-        for mid in manifest_ids:
-            sale_rows = conn.execute("""
-                SELECT s.sale_id, s.shipment_id, s.page_no, s.row_no,
-                       s.customer, s.pack_id, s.destino, s.status,
-                       COALESCE(p.mesa, s.mesa) AS mesa
-                  FROM s2_sales s
-                  LEFT JOIN s2_page_assign p
-                    ON p.manifest_id=s.manifest_id AND p.page_no=s.page_no
-                 WHERE s.manifest_id=?
-                 ORDER BY s.page_no, s.row_no, s.sale_id
-            """, (int(mid),)).fetchall()
-            item_rows = conn.execute("""
-                SELECT sale_id, sku, qty
-                  FROM s2_items
-                 WHERE manifest_id=?
-                 ORDER BY sale_id, sku
-            """, (int(mid),)).fetchall()
-            items_by_sale = {}
-            for sid, sku, qty in item_rows:
-                sku_txt = normalize_sku(sku)
-                title = inv_map_sku.get(sku_txt) or inv_map_sku.get(str(sku).strip()) or ""
-                if not title:
-                    unknown.add(sku_txt or str(sku))
-                items_by_sale.setdefault(str(sid), []).append({
-                    "sku": sku_txt or str(sku),
-                    "cantidad": int(qty or 0),
-                    "descripcion_kame": title,
-                })
-
-            label_rows = conn.execute("""
-                SELECT shipment_id, raw FROM s2_labels WHERE manifest_id=?
-            """, (int(mid),)).fetchall()
-            label_map = {str(ship): raw for ship, raw in label_rows if ship}
-
-            for sid, ship, page, row, customer, pack, destino, status, mesa in sale_rows:
-                sid = str(sid)
-                ship = str(ship or "").strip()
-                ventas.append({
-                    "lote": f"Lote #{mid}", "pagina_ml": int(page or 1),
-                    "fila_ml": int(row or 0), "venta": sid, "envio": ship,
-                    "cliente": customer or "", "pack_id": pack or "",
-                    "destino": destino or "", "mesa": mesa,
-                    "estado": status or "", "items": items_by_sale.get(sid, []),
-                })
-                if not ship:
-                    missing.append(f"Lote #{mid} · Venta {sid}: sin número de envío")
-                elif ship in seen_shipments:
-                    duplicates.append(f"Lote #{mid} · Venta {sid}: envío {ship} repetido")
-                else:
-                    seen_shipments.add(ship)
-                    raw = label_map.get(ship)
-                    if raw and _is_printable_zpl(str(raw)):
-                        zpl.append(str(raw))
-                    else:
-                        missing.append(f"Lote #{mid} · Venta {sid}: falta ZPL del envío {ship}")
-    finally:
-        conn.close()
-    return {"ventas": ventas, "etiquetas_zpl": zpl, "faltantes": missing,
-            "skus_sin_kame": sorted(unknown), "envios_duplicados": duplicates,
-            "envios_unicos": len(seen_shipments)}
-
-
-def _s2_render_despacho_docs(inv_map_sku: dict):
-    """Bloque compartido con Carga y Administrador de Sorting."""
+def page_manifiestos_y_etiquetas(inv_map_sku: dict):
     from io import BytesIO
-    from pypdf import PdfReader
+    from pypdf import PdfReader, PdfWriter
     from despacho_kame import create_kame_manifest_pdf, convert_zpl_labels_to_pdf, merge_label_pdfs
+    from manifiestos_etiquetas import list_batches, load_selected
 
-    manifests = _s2_list_dispatch_manifests()
-    if not manifests:
-        st.info("Aún no existen ventas en Sorting para generar documentos.")
-        return
-    labels = [m["label"] for m in manifests]
-    mids_by_label = {m["label"]: m["id"] for m in manifests}
-    selected = st.multiselect(
-        "Lotes de despacho (selecciona solo los Flex si necesitas el PDF de etiquetas Flex)",
-        labels, default=labels[:1], key="s2_docs_selected_lots",
-    )
-    if not selected:
-        st.info("Selecciona uno o varios lotes para preparar los documentos.")
-        return
-    mids = [mids_by_label[name] for name in selected]
-    data = _s2_despacho_data(mids, inv_map_sku or {})
-    ventas = data["ventas"]
-    labels_zpl = data["etiquetas_zpl"]
-    missing = data["faltantes"]
-    unknown = data["skus_sin_kame"]
-    duplicate = data["envios_duplicados"]
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Ventas en los lotes", len(ventas))
-    m2.metric("Etiquetas Flex identificadas", len(labels_zpl))
-    m3.metric("Ventas sin etiqueta", len(missing))
-    st.caption("El PDF Kame mantiene venta, SKU, cantidad y referencia a la página/mesa del Control original. Los lotes cerrados también pueden descargarse.")
-    if unknown:
-        st.warning(f"Hay {len(unknown)} SKU sin descripción en el maestro Kame: " +
-                   ", ".join(unknown[:12]) + ("…" if len(unknown) > 12 else "") +
-                   ". Se marcarán como 'SIN DESCRIPCION KAME - REVISAR'.")
-    if duplicate:
-        st.info(f"{len(duplicate)} ventas comparten envío con otro registro. Se imprimirá una sola etiqueta por número de envío.")
-    if missing:
-        st.error(f"Faltan etiquetas para {len(missing)} ventas. No se habilita conversión ZPL hasta resolverlo.")
-        with st.expander("Detalle de ventas sin etiqueta", expanded=False):
-            st.dataframe([{"Observación": line} for line in missing], hide_index=True, use_container_width=True)
-
-    if ventas:
-        try:
-            pdf_kame = create_kame_manifest_pdf(ventas)
-            st.download_button(
-                "Descargar manifiesto Kame (PDF)", data=pdf_kame,
-                file_name="Aurora_Manifiesto_Kame_" + "_".join(str(x) for x in mids) + ".pdf",
-                mime="application/pdf", key="s2_docs_kame_pdf", use_container_width=True,
-            )
-        except Exception as exc:
-            st.error(f"Error al generar el manifiesto Kame: {exc}")
-
-    st.markdown("**Etiquetas Flex: generar un PDF único (una etiqueta por página)**")
-    source = st.radio(
-        "Formato de las etiquetas que tienes",
-        ["ZPL/TXT ya cargados en Sorting", "PDF originales de Mercado Libre (unir localmente)"],
-        horizontal=True, key="s2_docs_labels_source",
-    )
-    # Invalida la descarga si cambian ventas o etiquetas dentro del mismo lote.
-    content_signature = hashlib.sha256()
-    for sale in ventas:
-        content_signature.update((str(sale["lote"]) + "|" + sale["venta"] + "|" + sale["envio"]).encode("utf-8"))
-    for raw in labels_zpl:
-        content_signature.update(str(raw).encode("utf-8"))
-    selection_key = (tuple(mids), content_signature.hexdigest())
-    saved = st.session_state.get("s2_docs_labels_result")
-    if saved and saved.get("key") != (selection_key, source):
-        st.session_state.pop("s2_docs_labels_result", None)
-        saved = None
-
-    if source.startswith("ZPL"):
-        st.caption("Las etiquetas ZPL se convertirán mediante Labelary, como en el conversor ZPL Aurora. "
-                   "La solicitud envía al servicio externo los datos de destinatarios y domicilios incluidos en las etiquetas.")
-        consent = st.checkbox(
-            "Autorizo enviar las etiquetas a Labelary exclusivamente para convertirlas a PDF",
-            key="s2_docs_labelary_consent",
-        )
-        if st.button(
-            "Preparar PDF consolidado Flex desde ZPL", type="primary",
-            disabled=not (ventas and labels_zpl and not missing and consent),
-            key="s2_docs_convert_zpl",
-        ):
-            indicator = st.progress(0.0, text="Convirtiendo etiquetas…")
-            try:
-                def update(done, total):
-                    indicator.progress(done / total, text=f"Bloque {done}/{total} convertido")
-                with st.spinner("Generando las etiquetas auténticas de Mercado Libre…"):
-                    result = convert_zpl_labels_to_pdf(labels_zpl, progress=update)
-                st.session_state["s2_docs_labels_result"] = {
-                    "key": (selection_key, source), "data": result,
-                    "pages": len(labels_zpl),
-                }
-                st.success(f"PDF preparado: {len(labels_zpl)} etiquetas / páginas.")
-            except Exception as exc:
-                st.session_state.pop("s2_docs_labels_result", None)
-                st.error(f"Error al convertir ZPL: {exc}. No se generó un PDF parcial.")
-            finally:
-                indicator.empty()
-    else:
-        uploaded = st.file_uploader(
-            "Carga los PDF de etiquetas correspondientes a estos lotes",
-            type=["pdf"], accept_multiple_files=True, key="s2_docs_label_pdfs",
-        )
-        uploaded_signature = tuple(
-            (f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in (uploaded or [])
-        )
-        if st.session_state.get("s2_docs_labels_result", {}).get("uploaded_signature") != uploaded_signature:
-            st.session_state.pop("s2_docs_labels_result", None)
-        if uploaded:
-            try:
-                pages = sum(len(PdfReader(BytesIO(f.getvalue())).pages) for f in uploaded)
-                st.caption(f"{len(uploaded)} archivos PDF · {pages} páginas · {data['envios_unicos']} envíos únicos en los lotes.")
-                if pages != data["envios_unicos"]:
-                    st.error("El número de páginas no coincide con los envíos únicos. "
-                             "Verifica que incluiste todas las etiquetas (una etiqueta por página).")
-            except Exception as exc:
-                pages = 0
-                st.error(f"No se pudieron leer los PDF seleccionados: {exc}")
-        else:
-            pages = 0
-        if st.button(
-            "Unir todos los PDF de etiquetas", type="primary", key="s2_docs_merge_label_pdfs",
-            disabled=not (uploaded and pages == data["envios_unicos"] and bool(ventas)),
-        ):
-            try:
-                result = merge_label_pdfs([f.getvalue() for f in uploaded])
-                st.session_state["s2_docs_labels_result"] = {
-                    "key": (selection_key, source), "data": result, "pages": pages,
-                    "uploaded_signature": uploaded_signature,
-                }
-            except Exception as exc:
-                st.session_state.pop("s2_docs_labels_result", None)
-                st.error(f"No fue posible unir los PDF: {exc}")
-
-    saved = st.session_state.get("s2_docs_labels_result")
-    if saved and saved["key"] == (selection_key, source):
-        st.download_button(
-            f"Descargar todas las etiquetas Flex ({saved['pages']} páginas)",
-            data=saved["data"],
-            file_name="Aurora_Etiquetas_Flex_" + "_".join(str(x) for x in mids) + ".pdf",
-            mime="application/pdf", use_container_width=True, key="s2_docs_download_labels",
-        )
-
-
-def page_sorting_upload(inv_map_sku, barcode_to_sku):
-    _s2_create_tables()
-    _s2_migrate_staged_to_active()
-    st.title("Sorting - Carga y Corridas")
-
-    open_manifests = _s2_list_open_manifests()
-    locked_mesas_all = _s2_get_locked_mesas()
-
-    if st.session_state.get("s2_upload_flash"):
-        st.success(st.session_state.get("s2_upload_flash"))
-        st.session_state["s2_upload_flash"] = ""
-
-    if open_manifests:
-        resumen = []
-        for mf in open_manifests:
-            progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
-            resumen.append({
-                "Lote": mf["lot_label"],
-                "Mesas": mf["mesas_text"],
-                "Ventas": mf["sales_total"],
-                "Avance ventas": progreso,
-                "Control": mf["control_name"] or "-",
-                "Etiquetas": mf["labels_name"] or "-",
-            })
-        with st.expander("Lotes activos", expanded=True):
-            st.dataframe(resumen, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay lotes activos todavía. Carga el primer Control + Etiquetas para comenzar.")
-
-    if locked_mesas_all:
-        st.caption(f"Mesas bloqueadas por lotes activos abiertos: {', '.join(map(str, locked_mesas_all))}")
-
-    with st.expander("Documentos de despacho: manifiesto Kame + PDF etiquetas Flex", expanded=False):
-        _s2_render_despacho_docs(inv_map_sku)
-
-    mode = st.radio(
-        "Modo de carga",
-        ["Uno (1 Control + 1 Etiquetas)", "Varios (lote: varios Controles + varias Etiquetas)"],
-        horizontal=True,
-        key="s2_upload_mode",
-    )
-
-    if mode.startswith("Uno"):
-        col1, col2 = st.columns(2)
-        with col1:
-            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
-        with col2:
-            zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
-
-        st.caption("Al confirmar, la carga entra directo a producción, pero ahora tú eliges exactamente qué página va a cada mesa.")
-
-        single_preview_pages = []
-        single_assignments = {}
-        single_warnings = []
-        if pdf is not None:
-            try:
-                parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
-                single_preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
-            except Exception:
-                single_preview_pages = []
-
-        if pdf is not None or zpl is not None:
-            with st.container(border=True):
-                st.markdown("**Resumen de la carga lista para confirmar**")
-                st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
-                st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
-
-                if single_preview_pages:
-                    st.write(f"**Páginas detectadas en el Control:** {len(single_preview_pages)}")
-                    single_assignments, single_warnings, _ = _s2_render_assignment_editor(
-                        single_preview_pages,
-                        widget_prefix="s2_single_assign",
-                    )
-                    st.dataframe(
-                        [{"Página": int(p), "Mesa": int(m)} for p, m in sorted(single_assignments.items())],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.info("No pude previsualizar las páginas del Control antes de confirmar.")
-
-                if single_warnings:
-                    for msg in single_warnings:
-                        st.warning(msg)
-
-        process_one = st.button(
-            "Confirmar carga de Control + Etiquetas",
-            type="primary",
-            disabled=(pdf is None and zpl is None),
-            key="s2_process_single_upload",
-        )
-
-        if process_one:
-            if pdf is None:
-                st.error("Debes subir el Control (PDF) antes de confirmar la carga.")
-            elif zpl is None:
-                st.error("Debes subir también las Etiquetas (TXT/ZPL) antes de confirmar la carga.")
-            elif not single_preview_pages:
-                st.error("No pude detectar páginas del Control para asignarlas manualmente.")
-            elif single_warnings:
-                st.error("Corrige la asignación Página → Mesa antes de confirmar.")
-            else:
-                pdf_name = getattr(pdf, "name", "control.pdf")
-                pdf_bytes = pdf.getvalue()
-                zpl_name = getattr(zpl, "name", "etiquetas.txt")
-                zpl_bytes = zpl.getvalue()
-
-                target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
-                _s2_apply_page_assignments(target_mid, single_assignments)
-                n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
-                created = _s2_create_corridas(target_mid)
-
-                lot_label = _s2_lot_label(target_mid)
-                st.session_state["sorting_manifest_id"] = target_mid
-                st.session_state["s2_upload_flash"] = f"{lot_label} cargado correctamente: {n_sales} ventas, {n_labels} etiquetas y {created} corridas activas."
-
-                for k in ("s2_control_pdf", "s2_labels_txt"):
-                    if k in st.session_state:
-                        del st.session_state[k]
-                st.rerun()
-
-    else:
-        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y tú defines manualmente la página que irá a cada mesa.")
-        col1, col2 = st.columns(2)
-        with col1:
-            pdfs = st.file_uploader(
-                "Controles (PDF) — puedes subir varios",
-                type=["pdf"],
-                accept_multiple_files=True,
-                key="s2_control_pdfs",
-            )
-        with col2:
-            zpls = st.file_uploader(
-                "Etiquetas (TXT/ZPL) — puedes subir varios",
-                type=["txt", "zpl"],
-                accept_multiple_files=True,
-                key="s2_labels_txts",
-            )
-
-        batch_preview_pages = _s2_preview_batch_pages(pdfs)
-        batch_assignments = {}
-        batch_warnings = []
-
-        if pdfs or zpls:
-            with st.container(border=True):
-                st.markdown("**Resumen del lote listo para confirmar**")
-                st.write(f"**Controles:** {', '.join(getattr(x, 'name', '-') for x in (pdfs or [])) or '-'}")
-                st.write(f"**Etiquetas:** {', '.join(getattr(x, 'name', '-') for x in (zpls or [])) or '-'}")
-                if batch_preview_pages:
-                    st.write(f"**Páginas detectadas en el lote:** {len(batch_preview_pages)}")
-                    batch_assignments, batch_warnings, _ = _s2_render_assignment_editor(
-                        batch_preview_pages,
-                        widget_prefix="s2_batch_assign",
-                    )
-                    st.dataframe(
-                        [{"Página": int(p), "Mesa": int(m)} for p, m in sorted(batch_assignments.items())],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.info("Sube los Controles para poder definir la asignación manual de páginas.")
-                if batch_warnings:
-                    for msg in batch_warnings:
-                        st.warning(msg)
-
-        do_batch = st.button(
-            "Procesar lote en una sola tanda",
-            type="primary",
-            disabled=(not pdfs and not zpls),
-            key="s2_do_batch",
-        )
-
-        if do_batch:
-            if not pdfs:
-                st.error("Debes subir al menos un Control (PDF).")
-            elif not zpls:
-                st.error("Debes subir al menos un archivo de Etiquetas (TXT/ZPL).")
-            elif not batch_preview_pages:
-                st.error("No pude detectar páginas en los Controles del lote.")
-            elif batch_warnings:
-                st.error("Corrige la asignación Página → Mesa antes de procesar el lote.")
-            else:
-                target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                total_sales = 0
-                offset = 0
-                control_names = []
-                for i, pdf in enumerate(pdfs):
-                    name = getattr(pdf, "name", f"control_{i+1}.pdf")
-                    control_names.append(name)
-                    if i == 0:
-                        total_sales += int(_s2_upsert_control(target_mid, name, pdf.getvalue()) or 0)
-                    else:
-                        offset = _s2_get_max_page(target_mid)
-                        total_sales += int(_s2_append_control(target_mid, name, pdf.getvalue(), page_offset=offset) or 0)
-
-                _s2_apply_page_assignments(target_mid, batch_assignments)
-
-                total_labels = 0
-                label_names = []
-                for i, z in enumerate(zpls):
-                    name = getattr(z, "name", f"etiquetas_{i+1}.txt")
-                    label_names.append(name)
-                    if i == 0:
-                        total_labels += int(_s2_upsert_labels(target_mid, name, z.getvalue()) or 0)
-                    else:
-                        total_labels += int(_s2_append_labels(target_mid, name, z.getvalue()) or 0)
-
-                try:
-                    conn = get_conn()
-                    c = conn.cursor()
-                    row = c.execute("SELECT control_pdf, labels_txt FROM s2_files WHERE manifest_id=?;", (target_mid,)).fetchone()
-                    c.execute(
-                        """INSERT INTO s2_files(manifest_id, control_pdf, labels_txt, control_name, labels_name, updated_at)
-                             VALUES(?, ?, ?, ?, ?, ?)
-                             ON CONFLICT(manifest_id) DO UPDATE SET
-                                 control_name=excluded.control_name,
-                                 labels_name=excluded.labels_name,
-                                 updated_at=excluded.updated_at;""",
-                        (target_mid, row[0] if row else None, row[1] if row else None, " + ".join(control_names), " + ".join(label_names), _s2_now_iso())
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
-
-                created = _s2_create_corridas(target_mid)
-                lot_label = _s2_lot_label(target_mid)
-                st.session_state["s2_upload_flash"] = f"{lot_label} cargado correctamente: {total_sales} ventas, {total_labels} etiquetas y {created} corridas activas."
-                for k in ("s2_control_pdfs", "s2_labels_txts"):
-                    if k in st.session_state:
-                        del st.session_state[k]
-                st.rerun()
-
-    st.subheader("Resumen de conciliación")
-    if open_manifests:
-        opts = {mf['lot_label']: int(mf['id']) for mf in open_manifests}
-        view_label = st.selectbox("Ver conciliación de lote", options=list(opts.keys()), key="s2_summary_lot_view")
-        view_mid = opts[view_label]
-        stats = _s2_get_stats(view_mid)
-        with st.expander("Ver detalle de conciliación", expanded=False):
-            st.write(
-                {
-                    "Lote": view_label,
-                    "Ventas con Pack ID": stats["ventas_with_pack"],
-                    "Packs distintos (Control)": stats["distinct_packs"],
-                    "Ventas con Envío (Control)": stats["ventas_with_ship"],
-                    "Etiquetas con Pack ID": stats["labels_with_pack"],
-                    "Etiquetas con Venta": stats["labels_with_sale"],
-                    "Ventas matcheadas por Pack": stats["matched_by_pack"],
-                    "Ventas sin Envío asignado": stats["missing_ship"],
-                }
-            )
-
-        st.subheader("Asignación Página → Mesa")
-        assigns = _s2_get_assignments(view_mid)
-        if assigns:
-            st.dataframe(
-                [{"Página": int(p), "Mesa": int(m)} for p, m in assigns],
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("Este lote todavía no tiene páginas asignadas.")
-
-
-def page_sorting_camarero(inv_map_sku, barcode_to_sku):
-    """Camarero compacto: scanner primero, producto actual segundo, detalles abajo.
-    BUILD: COMPACTO_227_MINIATURA_SIN_BOTON_LISTAS_RECOGIDAS
-    """
-    _s2_create_tables()
-    _s2_ensure_items_schema_runtime()
-
-    st.markdown("""
-    <style>
-    /* Compactación específica para Camarero/PDA */
-    .block-container {padding-top: 0.6rem !important; padding-bottom: 0.6rem !important;}
-    div[data-testid="stVerticalBlock"] > div {gap: 0.35rem;}
-    div[data-testid="stHorizontalBlock"] {gap: 0.55rem;}
-    .stTextInput input {height: 2.35rem !important; font-size: 0.95rem !important;}
-    .stNumberInput input {height: 2.35rem !important;}
-    button[kind="secondary"], .stButton button {min-height: 2.15rem !important; padding-top: 0.25rem !important; padding-bottom: 0.25rem !important;}
-    h1, h2, h3 {margin-top: 0.2rem !important; margin-bottom: 0.25rem !important;}
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown("### Camarero")
-
-    # Selector de mesa compacto arriba
-    _mesa_spacer, _mesa_col = st.columns([5, 1])
-    with _mesa_col:
-        mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
-    st.session_state["s2_mesa_int"] = int(mesa)
-
-    # Estado independiente por mesa: permite varios camareros/mesas en paralelo
-    mesa_key = int(mesa)
-    sale_key = f"s2_sale_open_mesa_{mesa_key}"
-    manifest_key = f"s2_sale_open_manifest_id_mesa_{mesa_key}"
-    pending_sku_key = f"s2_pending_sku_mesa_{mesa_key}"
-    pending_qty_key = f"s2_pending_qty_mesa_{mesa_key}"
-    pending_title_key = f"s2_pending_title_mesa_{mesa_key}"
-    sale_mesa_key = f"s2_sale_open_mesa_state_{mesa_key}"
-
-    st.session_state.setdefault(sale_key, None)
-    st.session_state.setdefault(manifest_key, None)
-    st.session_state.setdefault(pending_sku_key, None)
-    st.session_state.setdefault(pending_qty_key, 0)
-    st.session_state.setdefault(pending_title_key, "")
-
-    # Detectar manifiesto activo de la mesa
-    if st.session_state.get(sale_key) is not None and st.session_state.get(manifest_key):
-        mid = int(st.session_state.get(manifest_key))
-    else:
-        mid = _s2_find_manifest_by_mesa(int(mesa))
-        if not mid:
-            st.warning(f"La mesa {int(mesa)} no está asignada a ningún manifiesto abierto.")
-            return
-    st.session_state["sorting_manifest_id"] = mid
-
-    if _s2_is_mesa_closed(mid, int(mesa)):
-        st.success(f"La mesa {int(mesa)} ya fue cerrada en camarero.")
-        return
-
-    sale_id = st.session_state.get(sale_key)
-
-    # =========================
-    # 1) SCANNER SIEMPRE PRIMERO
-    # =========================
-    st.markdown("**Escanear etiqueta / producto**")
-
-    if sale_id is None:
-        if st.session_state.get("s2_clear_label_scan"):
-            st.session_state["s2_label_scan_widget"] = ""
-            st.session_state["s2_clear_label_scan"] = False
-
-        scan = st.text_input(
-            "Escanea etiqueta del envío",
-            key="s2_label_scan_widget",
-            placeholder="Escanea QR Flex o barra Colecta",
-            label_visibility="collapsed",
-        )
-        autofocus_input("Escanea etiqueta del envío")
-
-        if scan:
-            sid = _s2_extract_shipment_id(scan)
-            if not sid:
-                st.error("No pude leer el ID de envío desde el escaneo.")
-                sfx_emit("ERR")
-            else:
-                nxt = _s2_next_pending_sale_in_sequence(mid, int(mesa))
-                if not nxt:
-                    st.success("No hay más ventas pendientes en esta mesa.")
-                    close_cols = st.columns([1, 1, 4])
-                    if close_cols[0].button("🔒 Cerrar mesa", key=f"s2_close_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
-                        ok_close, err_close = _s2_close_mesa(mid, int(mesa))
-                        if ok_close:
-                            sfx_emit("OK")
-                            st.session_state["s2_clear_label_scan"] = True
-                            st.rerun()
-                        else:
-                            st.error(err_close or "No se pudo cerrar la mesa.")
-                            sfx_emit("ERR")
-                    if close_cols[1].button("↻ Refrescar", key=f"s2_refresh_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
-                        st.session_state["s2_clear_label_scan"] = True
-                        st.rerun()
-                else:
-                    expected_sale_id, expected_ship, expected_pack, expected_page = nxt
-                    sale_to_open = None
-                    if sid and expected_ship and str(sid) == str(expected_ship):
-                        sale_to_open = expected_sale_id
-                    elif sid and expected_pack and str(sid) == str(expected_pack):
-                        sale_to_open = expected_sale_id
-
-                    if sale_to_open:
-                        st.session_state[sale_key] = sale_to_open
-                        st.session_state[manifest_key] = mid
-                        st.session_state[sale_mesa_key] = int(mesa)
-                        st.session_state["s2_clear_label_scan"] = True
-                        sfx_emit("OK")
-                        st.rerun()
-                    else:
-                        # Buscar ubicación real de la etiqueta en cualquier lote abierto o histórico.
-                        conn = get_conn()
-                        c = conn.cursor()
-                        rows = c.execute("""
-                            SELECT
-                                s.manifest_id,
-                                ('Lote ' || s.manifest_id) AS lote,
-                                s.mesa,
-                                s.page_no,
-                                s.sale_id,
-                                s.shipment_id,
-                                s.pack_id,
-                                s.status
-                            FROM s2_sales s
-                            WHERE s.shipment_id=? OR s.pack_id=?
-                            ORDER BY s.manifest_id DESC, s.page_no, s.sale_id
-                            LIMIT 10;
-                        """, (sid, sid)).fetchall()
-                        conn.close()
-
-                        exp_id = str(expected_ship or expected_pack or "")
-                        if rows:
-                            msg = ["Etiqueta detectada, pero no corresponde a la próxima lectura obligatoria."]
-                            for r in rows:
-                                _mid, lote, mesa_real, page_real, sale_real, ship_real, pack_real, status_real = r
-                                msg.append(
-                                    f"- Pertenece a **{lote}**, **Mesa {mesa_real}**, **Página {page_real}**, "
-                                    f"Venta `{sale_real}`, Envío `{ship_real or pack_real}`, Estado `{status_real}`."
-                                )
-                            msg.append(f"\nPróxima etiqueta esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
-                            st.error("\n".join(msg))
-                        else:
-                            st.error(f"No encontré esta etiqueta en los manifiestos. Próxima esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
-                        sfx_emit("ERR")
-
-    
-    else:
-        # Limpieza segura del campo de producto
-        if st.session_state.get("s2_clear_prod_scan"):
-            st.session_state["s2_prod_scan_widget"] = ""
-            st.session_state["s2_clear_prod_scan"] = False
-
-        pending_sku = st.session_state.get(pending_sku_key)
-        sku_scan = st.text_input(
-            "Escanea producto",
-            key="s2_prod_scan_widget",
-            placeholder="Escanea EAN / SKU del producto",
-            disabled=bool(pending_sku),
-            label_visibility="collapsed",
-        )
-        autofocus_input("Escanea producto")
-
-        sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
-        if sku_scan and not pending_sku:
-            sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
-
-            row = None
-            for _sku, _desc, _qty, _picked, _status in _s2_sale_items(mid, sale_id):
-                if str(_sku) == str(sku):
-                    row = (_qty, _picked, _desc)
-                    break
-
-            if not row:
-                st.error("SKU/EAN no pertenece a esta venta.")
-                sfx_emit("ERR")
-            else:
-                qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
-                remaining = max(0, qty_req - picked_now)
-
-                title_show = ""
-                if isinstance(inv_map_sku, dict):
-                    k = str(sku).strip()
-                    title_show = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-                title_show = title_show or (desc_ml or "") or str(sku)
-
-                if remaining <= 0:
-                    st.info(f"✅ Ya está completo: {title_show}")
-                    st.session_state["s2_clear_prod_scan"] = True
-                    sfx_emit("ERR")
-                    st.rerun()
-                else:
-                    sfx_emit("OK")
-                    st.session_state[pending_sku_key] = str(sku)
-                    st.session_state[pending_qty_key] = int(remaining)
-                    st.session_state[pending_title_key] = str(title_show)
-                    st.session_state["s2_clear_prod_scan"] = True
-                    st.rerun()
-
-    # =========================
-    # DATOS COMUNES DE VENTA / LISTAS
-    # =========================
-    if sale_id is None:
-        # Sin venta abierta: mostrar mesa abajo, no arriba
-        with st.expander(f"🏷️ Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
-            conn = get_conn()
-            c = conn.cursor()
-            rows = c.execute("""
-                SELECT page_no, row_no, sale_id, shipment_id, customer, status
-                FROM s2_sales
-                WHERE manifest_id=? AND mesa=?
-                ORDER BY page_no, row_no, sale_id;
-            """, (mid, int(mesa))).fetchall()
-            conn.close()
-            if rows:
-                df = pd.DataFrame(rows, columns=["Página", "Orden", "Venta", "Etiqueta/Envío", "Cliente", "Estado"])
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No hay etiquetas asignadas a esta mesa.")
-        st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
-        return
-
-    # Venta abierta
+    st.header("5) Manifiestos y etiquetas")
+    st.caption("Documentos de las tandas cargadas en Picking, incluso tras reiniciar la corrida.")
     conn = get_conn()
-    c = conn.cursor()
-    sale_row = c.execute("""
-        SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status
-        FROM s2_sales
-        WHERE manifest_id=? AND sale_id=?;
-    """, (mid, sale_id)).fetchone()
-    conn.close()
-
-    shipment_id = sale_row[0] if sale_row else ""
-    pack_id = sale_row[1] if sale_row else ""
-    customer = sale_row[2] if sale_row else ""
-    destino_db = sale_row[3] if sale_row else ""
-    comuna_db = sale_row[4] if sale_row else ""
-    ciudad_dest_db = sale_row[5] if sale_row else ""
-    page_no = sale_row[6] if sale_row else ""
-    mesa_db = sale_row[7] if sale_row else ""
-
-    raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
-    info = _s2_parse_label_raw_info(raw_label)
-
-
-    items = _s2_sale_items(mid, sale_id)
-    total_items = len(items)
-    done_items = sum(1 for _sku, _d, _q, _p, stx in items if stx in ("DONE", "INCIDENCE"))
-
-    next_item = _s2_next_pending_item(mid, sale_id)
-
-    # =========================
-    # 2) PRODUCTO ACTUAL SEGUNDO
-    # =========================
-    st.markdown("**Producto actual**")
-
-    pending_sku = st.session_state.get(pending_sku_key)
-    if pending_sku:
-        pending_qty = int(st.session_state.get(pending_qty_key, 0) or 0)
-        pending_title = st.session_state.get(pending_title_key, "") or pending_sku
-
-        # Miniatura visible también durante el conteo validado.
-        try:
-            pending_pics, _pending_pub_link = get_picture_urls_for_sku(str(pending_sku))
-        except Exception:
-            pending_pics, _pending_pub_link = [], ""
-
-        validated_card = st.container(border=True)
-        with validated_card:
-            # En PDA evitamos columnas: primero información y acciones; miniatura pequeña abajo.
-            st.markdown(
-                f"""
-                <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:12px; padding:8px 10px; margin:0 0 6px 0;">
-                  <div style="font-size:11px; font-weight:800; color:#166534; letter-spacing:.04em;">VALIDADO · CONTAR</div>
-                  <div style="font-size:17px; font-weight:900; margin-top:2px; color:#111827; line-height:1.12;">{html.escape(str(pending_title))}</div>
-                  <div style="display:flex; align-items:flex-end; gap:8px; margin-top:2px;">
-                    <div style="font-size:12px; color:#374151; font-weight:800; padding-bottom:5px;">DEBEN HABER</div>
-                    <div style="font-size:46px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
-                    <div style="font-size:12px; color:#374151; font-weight:800; padding-bottom:6px;">UNIDAD(ES)</div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            cA, cB = st.columns([2, 1])
-            with cA:
-                if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
-                    ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
-                    if not ok:
-                        st.error(msg or "No se pudo aplicar.")
-                        sfx_emit("ERR")
-                    else:
-                        sfx_emit("OK")
-                        st.session_state[pending_sku_key] = None
-                        st.session_state[pending_qty_key] = 0
-                        st.session_state[pending_title_key] = ""
-                        st.session_state.pop("s2_show_shortage_form", None)
-                        st.rerun()
-            with cB:
-                if st.button("⚠️ FALTANTE", key=f"s2_short_open_{sale_id}_{pending_sku}", use_container_width=True):
-                    st.session_state["s2_show_shortage_form"] = f"{sale_id}|{pending_sku}"
-
-            if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{pending_sku}":
-                st.warning("Indica cuántas unidades faltan físicamente.")
-                miss_val = st.number_input(
-                    "Unidades faltantes",
-                    min_value=1,
-                    max_value=max(1, int(pending_qty)),
-                    value=1,
-                    step=1,
-                    key=f"s2_missing_qty_{sale_id}_{pending_sku}",
-                )
-                f1, f2 = st.columns([1, 1])
-                with f1:
-                    if st.button("✅ Registrar faltante", key=f"s2_short_confirm_{sale_id}_{pending_sku}", use_container_width=True):
-                        ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss_val))
-                        if not ok:
-                            st.error(msg or "No se pudo registrar faltante.")
-                            sfx_emit("ERR")
-                        else:
-                            sfx_emit("ERR")
-                            st.session_state[pending_sku_key] = None
-                            st.session_state[pending_qty_key] = 0
-                            st.session_state[pending_title_key] = ""
-                            st.session_state.pop("s2_show_shortage_form", None)
-                            st.rerun()
-                with f2:
-                    if st.button("Cancelar faltante", key=f"s2_short_cancel_{sale_id}_{pending_sku}", use_container_width=True):
-                        st.session_state.pop("s2_show_shortage_form", None)
-                        st.rerun()
-
-            if pending_pics:
-                st.image(pending_pics[0], width=55)
-            else:
-                st.caption("Sin imagen")
-
-    if (not pending_sku) and next_item:
-        sku, desc, qty, picked, status = next_item
-        title = ""
-        if isinstance(inv_map_sku, dict):
-            k = str(sku).strip()
-            title = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-        title = title or desc or str(sku)
-        faltan = max(0, int(qty) - int(picked))
-
-        card = st.container(border=True)
-        with card:
-            # En PDA las columnas se apilan; por eso el título va primero y la imagen queda pequeña abajo.
-            st.markdown(f"### {title}")
-            st.caption(f"SKU: {sku}")
-
-            # Acciones arriba para no obligar a bajar con el lector.
-            b1, b2 = st.columns(2)
-            if b1.button("⚠️ FALTANTE", key=f"s2_short_current_open_{sale_id}_{sku}", use_container_width=True):
-                st.session_state["s2_show_shortage_form"] = f"{sale_id}|{sku}"
-            if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
-                _s2_force_done_no_ean(mid, sale_id, str(sku))
-                st.session_state.pop("s2_show_shortage_form", None)
-                st.rerun()
-
-            if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{sku}":
-                st.warning("Indica cuántas unidades faltan físicamente.")
-                miss_val_current = st.number_input(
-                    "Unidades faltantes",
-                    min_value=1,
-                    max_value=max(1, int(faltan or 1)),
-                    value=1,
-                    step=1,
-                    key=f"s2_missing_qty_current_{sale_id}_{sku}",
-                )
-                f1, f2 = st.columns([1, 1])
-                with f1:
-                    if st.button("✅ Registrar faltante", key=f"s2_short_current_confirm_{sale_id}_{sku}", use_container_width=True):
-                        ok, msg = _s2_mark_shortage(mid, sale_id, str(sku), int(miss_val_current))
-                        if not ok:
-                            st.error(msg or "No se pudo registrar faltante.")
-                            sfx_emit("ERR")
-                        else:
-                            sfx_emit("ERR")
-                            st.session_state.pop("s2_show_shortage_form", None)
-                            st.rerun()
-                with f2:
-                        if st.button("Cancelar faltante", key=f"s2_short_current_cancel_{sale_id}_{sku}", use_container_width=True):
-                            st.session_state.pop("s2_show_shortage_form", None)
-                            st.rerun()
-
-            st.markdown(
-                f"""
-                <div style="border:1px solid #e5e7eb; background:#f8fafc; border-radius:10px; padding:7px 9px; margin:6px 0 6px 0;">
-                  <div style="font-size:12px; font-weight:900; color:#374151; letter-spacing:.02em;">FALTAN</div>
-                  <div style="font-size:38px; line-height:.9; font-weight:950; color:#111827; margin-top:1px;">{faltan}</div>
-                  <div style="font-size:12px; font-weight:700; color:#6b7280; margin-top:3px;">{int(picked)} / {int(qty)} verificadas</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            try:
-                pics, _pub_link = get_picture_urls_for_sku(str(sku))
-            except Exception:
-                pics, _pub_link = [], ""
-            if pics:
-                st.image(pics[0], width=55)
-            else:
-                st.caption("Sin imagen")
-    else:
-        st.success("✅ No quedan productos pendientes en esta venta.")
-
-    st.progress(0 if total_items == 0 else done_items / total_items)
-    st.caption(f"Avance venta: {done_items}/{total_items} productos finalizados")
-
-    done = _s2_is_sale_done(mid, sale_id)
-    st.markdown("**Cerrar venta**")
-    if st.button(
-        "✅ Cerrar venta y volver a escanear etiqueta",
-        key=f"s2_close_{sale_id}",
-        use_container_width=True,
-        disabled=not done,
-    ):
-        _s2_close_sale(mid, sale_id)
-        st.session_state[sale_key] = None
-        st.session_state[manifest_key] = None
-        st.session_state[sale_mesa_key] = None
-        st.session_state[pending_sku_key] = None
-        st.session_state[pending_qty_key] = 0
-        st.session_state[pending_title_key] = ""
-        st.session_state["s2_clear_prod_scan"] = True
-        st.session_state["s2_clear_label_scan"] = True
-        st.rerun()
-    if not done:
-        st.caption("Se habilita al completar todos los productos.")
-
-    # =========================
-    # DETALLES ABAJO, ABIERTOS POR DEFECTO
-    # =========================
-    with st.expander(f"🏷️ 4. Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
-        conn = get_conn()
-        c = conn.cursor()
-        rows = c.execute("""
-            SELECT page_no, row_no, sale_id, shipment_id, customer, status
-            FROM s2_sales
-            WHERE manifest_id=? AND mesa=?
-            ORDER BY page_no, row_no, sale_id;
-        """, (mid, int(mesa))).fetchall()
+    try:
+        tandas = list_batches(conn)
+    finally:
         conn.close()
-        if rows:
-            df = pd.DataFrame(rows, columns=["Página", "Orden", "Venta", "Etiqueta/Envío", "Cliente", "Estado"])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay etiquetas asignadas a esta mesa.")
-
-    with st.expander("5. Información etiqueta / cliente", expanded=False):
-        a, b, cx = st.columns(3)
-        a.metric("Envío", str(shipment_id) if shipment_id else "-")
-        b.metric("Pack ID", str(pack_id) if pack_id else "-")
-        cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
-
-        name = (info.get("destinatario") or customer or "-").strip() if isinstance(info, dict) else (customer or "-")
-        dom = (info.get("domicilio") or info.get("direccion") or destino_db or "-").strip() if isinstance(info, dict) else (destino_db or "-")
-        comuna = (info.get("comuna") or comuna_db or "-").strip() if isinstance(info, dict) else (comuna_db or "-")
-        ciudad_dest = (info.get("ciudad_destino") or ciudad_dest_db or "-").strip() if isinstance(info, dict) else (ciudad_dest_db or "-")
-
-        st.write(f"**Cliente:** {name}")
-        if dom and dom != "-":
-            st.write(f"**Domicilio:** {dom}")
-        if comuna and comuna != "-":
-            st.write(f"**Comuna:** {comuna}")
-        if ciudad_dest and ciudad_dest != "-":
-            st.write(f"**Ciudad destino:** {ciudad_dest}")
-
-    with st.expander(f"6. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=False):
-        if items:
-            rows = []
-            for idx, (sku, desc, qty, picked, status) in enumerate(items, start=1):
-                title = ""
-                if isinstance(inv_map_sku, dict):
-                    k = str(sku).strip()
-                    title = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-                title = title or desc or str(sku)
-                rows.append({
-                    "#": idx,
-                    "SKU": sku,
-                    "Descripción": title,
-                    "Solicitado": int(qty),
-                    "Verificado": int(picked),
-                    "Falta": max(0, int(qty) - int(picked)),
-                    "Estado": "PENDIENTE" if status == "PENDING" else status,
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay productos para esta venta.")
-
-def page_sorting_admin(inv_map_sku, barcode_to_sku):
-    _s2_create_tables()
-    _s2_migrate_staged_to_active()
-    st.title("Administrador")
-
-    _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
-
-    work_manifests = _s2_list_open_manifests()
-    if not work_manifests:
-        st.info("No hay lotes activos en Sorting.")
-        if st.button("🧹 Reiniciar todo Sorting", key="s2_reset_no_lots"):
-            _s2_reset_all_sorting()
-            st.success("Sorting reiniciado.")
-            st.rerun()
+    if not tandas:
+        st.info("Aún no hay tandas con documentos. Ve a 2) Importar ventas y adjunta sus etiquetas.")
         return
 
-    st.subheader("Lotes activos")
-    resumen = []
-    for mf in work_manifests:
-        progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
-        resumen.append({
-            "Lote": mf["lot_label"],
-            "Mesas": mf["mesas_text"],
-            "Ventas": mf["sales_total"],
-            "Pendientes": mf["sales_pending"],
-            "Avance": progreso,
-            "Control": mf["control_name"] or "-",
-            "Etiquetas": mf["labels_name"] or "-",
-        })
-    st.dataframe(resumen, use_container_width=True, hide_index=True)
-
-    options = {mf['lot_label']: int(mf['id']) for mf in work_manifests}
-    default_label = st.session_state.get("s2_admin_lot_label")
-    label_keys = list(options.keys())
-    if default_label not in label_keys:
-        default_label = label_keys[0]
-    selected_label = st.selectbox("Ver lote", options=label_keys, index=label_keys.index(default_label), key="s2_admin_lot_label")
-    mid = int(options[selected_label])
-
+    options = {f"[{t['operation']}] {t['created']} · {t['label']} · {t['sales']} ventas / {t['labels']} etiquetas":t["batch_key"]
+               for t in tandas}
+    default_option = next((label for label in options if label.startswith("[FLEX]")), next(iter(options)))
+    selection = st.multiselect("Tandas para imprimir o descargar", list(options),
+                               default=[default_option], key="docs_picking_batches")
+    if not selection:
+        st.info("Selecciona al menos una tanda.")
+        return
+    keys = [options[o] for o in selection]
+    flex_keys = [k for k in keys if next(t for t in tandas if t["batch_key"] == k)["operation"] == "FLEX"]
+    flex_label_count = sum(t["labels"] for t in tandas if t["batch_key"] in flex_keys)
     conn = get_conn()
-    c = conn.cursor()
-    f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
-    stats = _s2_get_stats(mid)
+    try:
+        data = load_selected(conn, keys, inv_map_sku)
+    except Exception as exc:
+        st.error(f"No fue posible recuperar los documentos: {exc}")
+        return
+    finally:
+        conn.close()
+    a,b,c = st.columns(3)
+    a.metric("Ventas",len(data["sales"]))
+    b.metric("Etiquetas Flex",flex_label_count)
+    c.metric("Tandas",len(keys))
 
-    st.subheader("Estado del lote")
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Lote", selected_label)
-    colB.metric("Ventas (Control)", stats.get("ventas", 0))
-    colC.metric("Items", stats.get("items", 0))
-    colD.metric("Etiquetas", stats.get("etiquetas", 0))
+    if data["unknown"]:
+        st.warning("SKU sin descripción Kame: " + ", ".join(data["unknown"][:15]))
+    if "SIN_CRUCE" in data["pairings"]:
+        st.warning("Algunas etiquetas no contienen un identificador de venta comprobable. "
+                   "Se ha respetado su orden de origen. Verifica que coincidan con las ventas antes de despachar.")
+    st.subheader("Manifiesto en idioma Kame")
+    try:
+        manifest_bytes = create_kame_manifest_pdf(data["sales"])
+        st.download_button("Descargar manifiesto Kame (PDF)", data=manifest_bytes,
+                           file_name="Manifiesto_Kame_" + "_".join(keys)[:100] + ".pdf",
+                           mime="application/pdf", use_container_width=True)
+    except Exception as exc:
+        st.error(f"No se pudo crear el manifiesto: {exc}")
 
-    if f:
-        control_name, labels_name, updated_at = f
-        st.caption(f"Mesas: {_s2_mesas_text_from_list(next((mf['mesas'] for mf in work_manifests if int(mf['id']) == mid), []))} · Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+    st.subheader("Etiquetas Flex consolidadas")
+    st.caption("Incluye únicamente las tandas marcadas Flex. Conserva su orden y las etiquetas originales.")
+    if not flex_keys:
+        st.info("Las tandas elegidas son Colecta. El PDF de etiquetas consolidadas está reservado a Flex.")
+        return
+    # Reunir segmentos en orden de selección para soportar tandas ZPL y PDF mixtas.
+    conn = get_conn()
+    try:
+        segments = []
+        for key in flex_keys:
+            meta = conn.execute("SELECT label_type FROM despacho_tandas WHERE batch_key=?", (key,)).fetchone()
+            if not meta:
+                raise ValueError("Tanda no encontrada.")
+            if meta[0] == "ZPL":
+                blocks = [x[0] for x in conn.execute(
+                    "SELECT zpl FROM despacho_etiquetas WHERE batch_key=? ORDER BY ordinal", (key,))]
+                segments.append(("ZPL", blocks))
+            else:
+                pdfs = [x[0] for x in conn.execute(
+                    "SELECT pdf_bytes FROM despacho_etiquetas_pdf WHERE batch_key=? ORDER BY ordinal", (key,))]
+                segments.append(("PDF", pdfs))
+    except Exception as exc:
+        st.error(f"No se pudieron preparar las etiquetas: {exc}")
+        return
+    finally:
+        conn.close()
+
+    needs_online = any(kind == "ZPL" for kind, _ in segments)
+    if needs_online:
+        st.info("Para etiquetas ZPL se usa Labelary (requiere Internet). "
+                "Sus archivos contienen nombres y domicilios que se transmitirán al servicio al convertirlos. "
+                "Las etiquetas PDF originales se unen localmente.")
+        consent = st.checkbox("Autorizo enviar las etiquetas ZPL seleccionadas a Labelary para su conversión a PDF",
+                              key="docs_picking_consent")
     else:
-        st.caption(f"Mesas: {_s2_mesas_text_from_list(next((mf['mesas'] for mf in work_manifests if int(mf['id']) == mid), []))}")
+        consent = True
+        st.success("Todos los archivos ya están en PDF. Se unirán localmente, sin transmitir etiquetas a terceros.")
 
-    st.divider()
-    with st.expander("Documentos de despacho: manifiesto Kame + PDF etiquetas Flex", expanded=False):
-        _s2_render_despacho_docs(inv_map_sku)
-
-    st.divider()
-    st.subheader("Trazabilidad")
-    rows = c.execute(
-        "SELECT mesa, COUNT(*) as ventas, SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) as done FROM s2_sales WHERE manifest_id=? GROUP BY mesa ORDER BY mesa;",
-        (mid,)
-    ).fetchall()
-    if rows:
-        mesa_data = []
-        for mesa, ventas, done in rows:
-            ventas = int(ventas or 0)
-            done = int(done or 0)
-            mesa_data.append({
-                "Mesa": int(mesa or 0),
-                "Ventas": ventas,
-                "Cerradas": done,
-                "%": 0 if ventas == 0 else round(done * 100 / ventas, 1),
-            })
-        st.dataframe(mesa_data, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay ventas asignadas a mesas todavía.")
-
-    st.divider()
-    st.subheader("Incidencias")
-    inc_rows = c.execute(
-        """SELECT s.sale_id, s.mesa, s.shipment_id,
-                  i.sku, i.description, i.qty, i.picked, i.status,
-                  COALESCE(i.confirm_mode,'') as confirm_mode,
-                  COALESCE(i.updated_at,'') as updated_at
-             FROM s2_items i
-             JOIN s2_sales s
-               ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
-            WHERE i.manifest_id=?
-              AND (i.status='INCIDENCE' OR i.confirm_mode='MANUAL_NO_EAN')
-            ORDER BY s.mesa, s.page_no, s.row_no, s.sale_id, i.sku;""",
-        (mid,),
-    ).fetchall()
-
-    if inc_rows:
-        df_inc = pd.DataFrame(inc_rows, columns=["Venta", "Mesa", "Envío", "SKU", "Descripción Control", "Solicitado", "Verificado", "Estado", "Modo", "Hora"])
-        def _title_tec_for_sku(sku_val, fallback_desc=""):
-            try:
-                if isinstance(inv_map_sku, dict):
-                    k = str(sku_val).strip()
-                    t = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-                    if t:
-                        return t
-            except Exception:
-                pass
-            return str(fallback_desc or sku_val or "")
+    # No presentar una descarga antigua después de cambiar el conjunto de tandas.
+    signature = tuple(keys)
+    cached = st.session_state.get("picking_docs_consolidated_pdf")
+    if cached and cached["key"] != signature:
+        cached = None
+        st.session_state.pop("picking_docs_consolidated_pdf",None)
+    if st.button("Preparar PDF de todas las etiquetas", type="primary",
+                 disabled=not consent, use_container_width=True):
         try:
-            df_inc["Producto (técnico)"] = df_inc.apply(lambda r: _title_tec_for_sku(r["SKU"], r["Descripción Control"]), axis=1)
-            df_inc = df_inc[["Mesa", "Venta", "Envío", "SKU", "Producto (técnico)", "Solicitado", "Verificado", "Estado", "Modo", "Hora"]]
-        except Exception:
-            pass
-        st.dataframe(df_inc, use_container_width=True, hide_index=True)
-    else:
-        st.info("Sin incidencias ni productos marcados como Sin EAN en este lote.")
-
-    st.divider()
-    st.subheader("Ventas pendientes")
-    pend = c.execute(
-        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, row_no, sale_id LIMIT 200;",
-        (mid,),
-    ).fetchall()
-    if pend:
-        pend_data = []
-        for sale_id, mesa, shipment_id, status in pend:
-            it = c.execute("SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) FROM s2_items WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
-            total = int(it[0] or 0)
-            done = int(it[1] or 0)
-            pend_data.append({"Venta": str(sale_id), "Mesa": int(mesa or 0), "Envío": str(shipment_id or ""), "Estado": str(status), "Items": f"{done}/{total}"})
-        st.dataframe(pend_data, use_container_width=True, hide_index=True)
-    else:
-        st.success("No hay ventas pendientes: todo está cerrado.")
-
-    with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
-        st.write({
-            "Lote": selected_label,
-            "Envíos únicos (labels)": stats.get("distinct_ship_labels"),
-            "Ventas con Pack ID": stats.get("ventas_with_pack"),
-            "Packs distintos (Control)": stats.get("distinct_packs"),
-            "Etiquetas con Pack ID": stats.get("labels_with_pack"),
-            "Etiquetas con Venta": stats.get("labels_with_sale"),
-            "Ventas matcheadas por Pack": stats.get("matched_by_pack"),
-            "Ventas sin Envío asignado": stats.get("missing_ship"),
-        })
-
-    st.divider()
-    st.subheader("Acciones")
-    close_ok = (
-        int(stats.get("sales_total", 0) or 0) > 0
-        and int(stats.get("sales_pending", 0) or 0) == 0
-        and int(stats.get("items_pending", 0) or 0) == 0
-    )
-    btn_close = st.button("✅ Cerrar lote", disabled=not close_ok)
-    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
-        st.info("Este lote se podrá cerrar cuando todas las ventas estén cerradas y no queden ítems pendientes.")
-
-    if btn_close:
-        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
-        _s2_close_manifest(mid)
-        st.session_state["s2_upload_flash"] = f"{selected_label} cerrado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
-        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
-
-    st.divider()
-    st.subheader("Eliminar lote")
-    st.caption("Esto borra solo el lote seleccionado y libera sus mesas para reutilizarlas.")
-    if f"s2_delete_confirm_{mid}" not in st.session_state:
-        st.session_state[f"s2_delete_confirm_{mid}"] = False
-    arm_delete = st.checkbox("Quiero eliminar este lote", key=f"s2_delete_confirm_{mid}")
-    do_delete = st.button("🗑️ Eliminar lote seleccionado", disabled=not arm_delete)
-    if do_delete:
-        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
-        _s2_delete_manifest(mid)
-        st.session_state["s2_upload_flash"] = f"{selected_label} eliminado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
-        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
-
-    if "s2_reset_armed" not in st.session_state:
-        st.session_state["s2_reset_armed"] = False
-
-    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
-    st.session_state["s2_reset_armed"] = bool(arm)
-
-    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
-    do_reset = st.button("💥 Reiniciar Sorting completo", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"))
-    if do_reset:
-        _s2_reset_all_sorting()
-        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label", "s2_upload_flash"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.success("Sorting reiniciado correctamente.")
-        st.rerun()
+            writer = PdfWriter()
+            progress = st.progress(0, text="Preparando etiquetas…")
+            for index, (kind, files) in enumerate(segments):
+                part = (convert_zpl_labels_to_pdf(files) if kind == "ZPL"
+                        else merge_label_pdfs(files))
+                reader = PdfReader(BytesIO(part), strict=False)
+                for page in reader.pages:
+                    writer.add_page(page)
+                progress.progress((index+1)/len(segments),
+                                  text=f"Tanda {index+1} de {len(segments)}")
+            output = BytesIO()
+            writer.write(output)
+            result = output.getvalue()
+            count = len(PdfReader(BytesIO(result), strict=False).pages)
+            if count != flex_label_count:
+                raise ValueError(f"Se esperaban {flex_label_count} páginas, pero se generaron {count}.")
+            st.session_state["picking_docs_consolidated_pdf"] = {"key":signature,"pdf":result,"pages":count}
+            st.success(f"PDF preparado: {count} páginas de etiquetas.")
+        except Exception as exc:
+            st.session_state.pop("picking_docs_consolidated_pdf",None)
+            st.error(f"No se completó la generación. No se entregará un PDF parcial: {exc}")
+    cached = st.session_state.get("picking_docs_consolidated_pdf")
+    if cached and cached["key"] == signature:
+        st.download_button("Descargar PDF único de etiquetas", data=cached["pdf"],
+                           file_name="Etiquetas_"+"_".join(keys)[:100]+".pdf",
+                           mime="application/pdf", use_container_width=True)
 
 
 def main():
-
-    st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
-
-    # 🔊 Sonidos globales (Sistema A)
+    st.set_page_config(page_title="Aurora ML – WMS (TEST)", layout="wide")
     sfx_sidebar()
     _sfx_unlock_render()
     _sfx_global_click_hook()
     sfx_render_pending()
     init_db()
     st.sidebar.warning("MODO PRUEBAS · SIN GOOGLE SHEETS · BD LOCAL INDEPENDIENTE")
-
-    # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, familia_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
-
-    # Auto-carga links de publicaciones (fotos por SKU) desde repo
     _ = publications_bootstrap(PUBLICATIONS_FILE)
-
-
-    # Si no hay modo seleccionado, mostramos lobby y salimos
-    if "app_mode" not in st.session_state:
-        page_app_lobby()
-        return
-
-    # Sidebar común
     st.sidebar.title("Ferretería Aurora – WMS")
-
-    # Botón para volver al lobby
-    if st.sidebar.button("⬅️ Cambiar modo"):
-        st.session_state.pop("app_mode", None)
-        st.session_state.pop("selected_picker", None)
-        st.rerun()
-
-    # Estado maestro (lo dejamos en sidebar, bajo el título)
     if os.path.exists(MASTER_FILE):
-        st.sidebar.success(f"Maestro OK: {len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN")
-        if conflicts:
-            st.sidebar.warning(f"Conflictos EAN: {len(conflicts)} (se usa el primero)")
+        st.sidebar.success(f"Maestro: {len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN")
     else:
-        st.sidebar.warning(f"No se encontró {MASTER_FILE}. (La app funciona, pero sin maestro)")
-
-    mode = st.session_state.get("app_mode", "FLEX_PICK")
-    allowed_modes = {"FLEX_PICK", "SORTING"}
-    if mode not in allowed_modes:
-        st.session_state.pop("app_mode", None)
-        st.rerun()
-
-    # ==========
-    # MODO PICKING FLEX / COLECTA
-    # ==========
-    if mode == "FLEX_PICK":
-        # Los procesos de envío y rescate Sheets quedan completamente anulados en pruebas.
-        if PICKING_SHEETS_BACKUP_ENABLED:
-            trigger_picking_backup_sync_async(limit=PICKING_BACKUP_WORKER_LIMIT)
-            render_picking_backup_sidebar()
-            if _picking_local_is_empty() and not st.session_state.get("_picking_auto_recovery_checked", False):
-                st.session_state["_picking_auto_recovery_checked"] = True
-                recovered, recovery_msg = auto_restore_picking_if_database_was_lost()
-                if recovered:
-                    st.session_state["picking_recovery_flash"] = recovery_msg
-                    st.session_state.pop("selected_picker", None)
-                    st.rerun()
-                elif recovery_msg not in {"local_not_empty", "intentional_reset", "no_active_lotes", "recovery_in_progress"}:
-                    st.sidebar.warning(f"Rescate Sheets: {recovery_msg}")
-
-            if _picking_recovery_is_active():
-                st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se actualizará automáticamente al terminar.")
-                st.caption("No necesitas presionar F5. Verificando nuevamente en 2 segundos…")
-                time.sleep(2)
-                st.rerun()
-
-            recovery_flash = st.session_state.pop("picking_recovery_flash", None)
-            if recovery_flash:
-                st.success(f"☁️ {recovery_flash}")
-
-        pages = [
-            "1) Picking",
-            "2) Importar ventas",
-            "3) Cortes de la tanda (PDF)",
-            "4) Administrador",
-        ]
-        page = st.sidebar.radio("Menú", pages, index=0)
-
-        if page.startswith("1"):
-            page_picking()
-        elif page.startswith("2"):
-            page_import(inv_map_sku, familia_map_sku)
-        elif page.startswith("3"):
-            page_cortes_pdf_batch()
-        else:
-            page_admin()
-
-    # ==========
-    # MODO SORTING FLEX / COLECTA
-    # ==========
-    elif mode == "SORTING":
-        pages = [
-            "1) Camarero",
-            "2) Cargar manifiesto y asignar mesas",
-            "3) Administrador",
-        ]
-        page = st.sidebar.radio("Menú", pages, index=0)
-
-        if page.startswith("1"):
-            page_sorting_camarero(inv_map_sku, barcode_to_sku)
-        elif page.startswith("2"):
-            page_sorting_upload(inv_map_sku, barcode_to_sku)
-        else:
-            page_sorting_admin(inv_map_sku, barcode_to_sku)
+        st.sidebar.warning(f"No se encontró {MASTER_FILE}")
+    pages = [
+        "1) Picking",
+        "2) Importar ventas",
+        "3) Cortes de la tanda (PDF)",
+        "4) Administrador",
+        "5) Manifiestos y etiquetas",
+    ]
+    page = st.sidebar.radio("Menú", pages)
+    if page.startswith("1"):
+        page_picking()
+    elif page.startswith("2"):
+        page_import(inv_map_sku, familia_map_sku)
+    elif page.startswith("3"):
+        page_cortes_pdf_batch()
+    elif page.startswith("4"):
+        page_admin()
+    else:
+        page_manifiestos_y_etiquetas(inv_map_sku)
 
 
 if __name__ == "__main__":
     main()
-
-# PATCH_SAFE_S2_ITEMS_DYNAMIC_SCHEMA_2026_05_28

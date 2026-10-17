@@ -1,7 +1,6 @@
-"""Documentos para despacho de lotes Sorting de Aurora.
+"""Manifiestos Kame y etiquetas de despacho por tanda de picking Aurora.
 
-No modifica el Control original ni el estado de ventas. Con los registros de
-Sorting construye un manifiesto de Kame y un PDF de etiquetas ZPL reales.
+No modifica estados de picking ni comunicaciones en la nube.
 """
 from __future__ import annotations
 
@@ -76,7 +75,7 @@ def create_kame_manifest_pdf(sales: list[dict]) -> bytes:
     y = 0.0
     sheet_num = 0
 
-    def header(lot: str, control_page: int, mesa: object, continued: bool = False):
+    def header(lot: str, control_page: int, mesa: object, continued: bool = False, original_page: bool = True):
         nonlocal y, sheet_num
         if sheet_num:
             cv.showPage()
@@ -88,7 +87,9 @@ def create_kame_manifest_pdf(sales: list[dict]) -> bytes:
         cv.drawString(m, h - 34, "FERRETERIA AURORA  |  MANIFIESTO KAME")
         cv.setFont("Helvetica", 9)
         suffix = "  (continuacion)" if continued else ""
-        cv.drawString(m, h - 54, f"{lot}  |  Pag. Control ML: {control_page}  |  Mesa: {mesa or '-'}{suffix}")
+        page_reference = f"Pag. manifiesto ML: {control_page}" if original_page else "Documento generado desde Excel"
+        lot_short = _clean_text(lot)[:46]
+        cv.drawString(m, h - 54, f"{lot_short}  |  {page_reference}{suffix}")
         y = h - 90
         cv.setFillColor(colors.HexColor("#163854"))
         cv.setFont("Helvetica-Bold", 8)
@@ -102,7 +103,7 @@ def create_kame_manifest_pdf(sales: list[dict]) -> bytes:
 
     def ensure_space(required: float, sale: dict):
         if y - required < 45:
-            header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"), True)
+            header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"), True, sale.get("pagina_ml_original", True))
 
     def sale_header(sale: dict, continued=False):
         nonlocal y
@@ -136,14 +137,14 @@ def create_kame_manifest_pdf(sales: list[dict]) -> bytes:
                         group_key != (sale["lote"], int(sale["pagina_ml"])))
         group_key = (sale["lote"], int(sale["pagina_ml"]))
         if is_new_group:
-            header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"))
+            header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"), original_page=sale.get("pagina_ml_original", True))
         sale_header(sale)
         items = sale.get("items") or []
         if not items:
             ensure_space(18, sale)
             cv.setFillColor(colors.red)
             cv.setFont("Helvetica", 8)
-            cv.drawString(m + 5, y, "ATENCION: Esta venta no tiene productos en Sorting")
+            cv.drawString(m + 5, y, "ATENCION: Esta venta no tiene productos registrados")
             y -= 18
         for item in items:
             sku = _clean_text(item.get("sku"))
@@ -151,7 +152,7 @@ def create_kame_manifest_pdf(sales: list[dict]) -> bytes:
             lines = _wrap(name, w - 2 * m - 162, size=8)
             height = max(18, len(lines) * 11 + 7)
             if y - height < 45:
-                header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"), True)
+                header(sale["lote"], int(sale["pagina_ml"]), sale.get("mesa"), True, sale.get("pagina_ml_original", True))
                 sale_header(sale, continued=True)
             cv.setFillColor(colors.HexColor("#212E39"))
             cv.setFont("Helvetica-Bold", 8)

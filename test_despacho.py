@@ -15,7 +15,7 @@ for lot,page,n in [('Lote #1',1,15),('Lote #1',2,15),('Lote #2',1,20)]:
   records.append(dict(lote=lot, pagina_ml=page, mesa=2,venta=str(200000000000+i),envio=str(46000000000+i),cliente='Maria Ejemplo',pack_id='',items=[dict(sku='500101301800',descripcion_kame='ADHESIVO CERAMICO CON DESCRIPCION TECNICA KAME LARGA ANTIDESLIZANTE PARA CUBRIMIENTO EN CERAMICA DE BAJA ABSORCION '+str(i),cantidad=2), dict(sku='500101301801',descripcion_kame='',cantidad=1)]))
 
 pdf=create_kame_manifest_pdf(records)
-p=Path(__file__).resolve().parent / '_test_manifiesto_kame.pdf';p.write_bytes(pdf)
+# Mantener la prueba sin crear artefactos en el proyecto.
 reader=PdfReader(BytesIO(pdf))
 txt=' '.join(pg.extract_text() or '' for pg in reader.pages)
 assert len(reader.pages)>=3
@@ -23,7 +23,7 @@ assert txt.count('VENTA:') >= 50, txt.count('VENTA:')
 assert all(('VENTA: ' + str(200000000000+i)) in txt for i in range(15))
 assert 'SIN DESCRIPCION KAME' in txt
 assert '500101301800' in txt
-assert 'Pag. Control ML: 2' in txt
+assert 'Pag. manifiesto ML: 2' in txt
 
 calls=[]
 def fake_pdf(batch):

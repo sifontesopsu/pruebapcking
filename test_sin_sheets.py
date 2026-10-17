@@ -41,7 +41,9 @@ assert ns['restore_picking_batch_from_sheets']('PK-100')[0] is False
 assert ns['render_picking_backup_sidebar']() is None
 assert ns['render_picking_recovery_admin_ui']() is None
 
-# Las conexiones activas en main() quedan debajo del interruptor desactivado.
+# La edición de prueba no llama en main a ningún método de sincronización Sheets.
 main = next(x for x in tree.body if isinstance(x, ast.FunctionDef) and x.name=='main')
-assert any(isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == 'PICKING_SHEETS_BACKUP_ENABLED' for node in ast.walk(main))
+assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {
+    'trigger_picking_backup_sync_async','render_picking_backup_sidebar',
+    'auto_restore_picking_if_database_was_lost'} for node in ast.walk(main))
 print('OK: Sheets bloqueado en 10 puntos, sin HTTP ni cola de respaldo; BD de pruebas aislada.')
